@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /*
+    AcqDis — fixed dark theme.
+    White #FFFFFF · Pink #F084F0 · Dark Purple #110711 · Dark Gray #090909 · Black #000000
+    These variables are locked and never overridden by account branding.
+  */
+  :root {
+    --background:           285 15% 5%;
+    --foreground:           0 0% 97%;
+    --card:                 285 12% 8%;
+    --card-foreground:      0 0% 97%;
+    --popover:              285 14% 9%;
+    --popover-foreground:   0 0% 97%;
+    --primary:              302 83% 73%;
+    --primary-foreground:   285 30% 8%;
+    --secondary:            285 10% 13%;
+    --secondary-foreground:  0 0% 90%;
+    --muted:                285 10% 11%;
+    --muted-foreground:     285 8% 55%;
+    --accent:               285 12% 15%;
+    --accent-foreground:    0 0% 95%;
+    --destructive:          0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --success:              142 71% 45%;
+    --success-foreground:   0 0% 100%;
+    --warning:              38 92% 50%;
+    --warning-foreground:   0 0% 100%;
+    --border:               285 10% 15%;
+    --input:                285 10% 13%;
+    --ring:                 302 83% 73%;
+    --sidebar:              285 20% 4%;
+    --sidebar-foreground:   0 0% 88%;
+    --sidebar-border:       285 12% 12%;
+    --radius:               0.5rem;
+    --chart-1:              302 83% 73%;
+    --chart-2:              160 60% 45%;
+    --chart-3:              30 80% 55%;
+    --chart-4:              200 70% 55%;
+    --chart-5:              340 75% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+@layer components {
+  .sidebar-link {
+    @apply flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-sidebar-foreground/60 transition-colors hover:bg-accent hover:text-sidebar-foreground;
+  }
+  .sidebar-link-active {
+    @apply bg-primary text-primary-foreground border border-primary;
+  }
+}
+
+@layer utilities {
+  .animate-in {
+    animation: animate-in 0.2s ease-out;
+  }
+  .animate-fade-in {
+    animation: fade-in 0.3s ease-out;
+  }
+  .animate-slide-in {
+    animation: slide-in 0.25s ease-out;
+  }
+}
+
+@keyframes animate-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes slide-in {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
+}
+
+::-webkit-scrollbar        { width: 6px; height: 6px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: hsl(var(--border)); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }

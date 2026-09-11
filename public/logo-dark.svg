@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 420" fill="none">
+  <!--
+    AcqDis logomark — dark-background variant
+    A = white  |  D = #F084F0 (pink)
+    Proportions traced from the original PNG.
+  -->
+
+  <!-- ── A (house / chevron) in WHITE ── -->
+  <!-- Left leg of the A -->
+  <polygon points="170,38  12,398  95,398  170,238" fill="#FFFFFF"/>
+  <!-- Right leg of the A (stops where the D's diagonal begins) -->
+  <polygon points="170,238 248,398 330,398 208,52" fill="#FFFFFF"/>
+
+  <!-- Four window squares in the A crossbar area -->
+  <rect x="133" y="298" width="30" height="30" fill="#090909"/>
+  <rect x="169" y="298" width="30" height="30" fill="#090909"/>
+  <rect x="133" y="334" width="30" height="30" fill="#090909"/>
+  <rect x="169" y="334" width="30" height="30" fill="#090909"/>
+
+  <!-- ── D in PINK #F084F0 ── -->
+  <!-- The D shape: vertical bar on left + curved bowl on right -->
+  <!-- Left vertical bar of the D -->
+  <rect x="298" y="38" width="60" height="360" fill="#F084F0"/>
+  <!-- Outer arc of the D bowl -->
+  <path d="M338,38 Q508,38 508,218 Q508,398 338,398 L358,398 Q488,398 488,218 Q488,38 358,38 Z" fill="#F084F0"/>
+  <!-- Inner white cutout to create the D hollow -->
+  <path d="M358,108 Q428,108 428,218 Q428,328 358,328 L358,108 Z" fill="#090909"/>
+
+  <!-- Diagonal pink slash that visually links A to D (the shared stroke) -->
+  <polygon points="208,52 330,398 298,398 176,52" fill="#F084F0"/>
+</svg>
