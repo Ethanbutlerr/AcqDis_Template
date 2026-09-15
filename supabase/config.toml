@@ -1,0 +1,2 @@
+[functions.voice-token]
+verify_jwt = false

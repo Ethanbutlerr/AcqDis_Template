@@ -26,7 +26,13 @@ async function getTwilioCredentialMap(supabase: any, companyId: string) {
   return credentials;
 }
 
-async function authorizeUserRequest(req: Request, supabase: any, companyId: string, requestedUserId: string | undefined, permission: string) {
+async function authorizeUserRequest(
+  req: Request,
+  supabase: any,
+  companyId: string,
+  requestedUserId: string | undefined,
+  permission: string | string[],
+) {
   const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
   if (!token) return null;
   const { data: { user } } = await supabase.auth.getUser(token);
@@ -51,11 +57,16 @@ async function authorizeUserRequest(req: Request, supabase: any, companyId: stri
     .in("id", roleIds);
   const companyRoleIds = (companyRoles ?? []).map((role: { id: string }) => role.id);
   if (!companyRoleIds.length) return null;
-  const { data: permissionRow } = await supabase.from("permissions").select("id").eq("key", permission).maybeSingle();
-  if (!permissionRow) return null;
+  const permissionKeys = Array.isArray(permission) ? permission : [permission];
+  const { data: permissionRows } = await supabase
+    .from("permissions")
+    .select("id")
+    .in("key", permissionKeys);
+  const permissionIds = (permissionRows ?? []).map((row: { id: string }) => row.id);
+  if (!permissionIds.length) return null;
   const { data: rolePermission } = await supabase.from("role_permissions")
     .select("role_id")
-    .eq("permission_id", permissionRow.id)
+    .in("permission_id", permissionIds)
     .in("role_id", companyRoleIds)
     .limit(1)
     .maybeSingle();
@@ -149,11 +160,61 @@ async function validateTwilioWebhook(
   configuredUrl?: string,
 ): Promise<boolean> {
   const signature = req.headers.get("x-twilio-signature") ?? "";
-  return Boolean(
-    credentials.auth_token
-      && signature
-      && twilio.validateRequest(credentials.auth_token, signature, configuredUrl || req.url, params),
-  );
+  if (!signature) return false;
+
+  const requestUrl = new URL(req.url);
+  const candidateUrls = new Set<string>([req.url]);
+  if (configuredUrl) candidateUrls.add(configuredUrl);
+
+  // Supabase may expose the public project URL through a proxy. Twilio signs the
+  // public URL it called, so validate both the runtime URL and its canonical form.
+  candidateUrls.add(`${SUPABASE_URL.replace(/\/$/, "")}${requestUrl.pathname}${requestUrl.search}`);
+  const forwardedHost = (req.headers.get("x-forwarded-host") ?? "").split(",")[0].trim();
+  const forwardedProto = (req.headers.get("x-forwarded-proto") ?? "https").split(",")[0].trim();
+  if (forwardedHost) {
+    candidateUrls.add(`${forwardedProto}://${forwardedHost}${requestUrl.pathname}${requestUrl.search}`);
+  }
+
+  const webhookAccountSid = params.AccountSid ?? "";
+  const credentialCandidates = [
+    {
+      accountSid: credentials.account_sid ?? "",
+      authToken: credentials.auth_token ?? "",
+    },
+    {
+      accountSid: Deno.env.get("TWILIO_ACCOUNT_SID") ?? "",
+      authToken: Deno.env.get("TWILIO_AUTH_TOKEN") ?? "",
+    },
+  ];
+
+  return credentialCandidates.some(({ accountSid, authToken }) => {
+    if (!authToken || !accountSid || webhookAccountSid !== accountSid) return false;
+    return Array.from(candidateUrls).some((url) => {
+      try {
+        return twilio.validateRequest(authToken, signature, url, params);
+      } catch {
+        return false;
+      }
+    });
+  });
+}
+
+function logTwilioRejection(
+  reason: string,
+  req: Request,
+  params: Record<string, string>,
+  credentials?: Record<string, string>,
+) {
+  console.error("Twilio voice webhook rejected", {
+    reason,
+    request_path: new URL(req.url).pathname,
+    has_signature: Boolean(req.headers.get("x-twilio-signature")),
+    has_company_id: Boolean(params.CompanyId),
+    has_user_id: Boolean(params.UserId),
+    has_account_sid: Boolean(params.AccountSid),
+    has_company_auth_token: Boolean(credentials?.auth_token),
+    has_project_auth_token: Boolean(Deno.env.get("TWILIO_AUTH_TOKEN")),
+  });
 }
 
 async function handleRecordingCallback(req: Request): Promise<Response> {
@@ -181,9 +242,10 @@ async function handleRecordingCallback(req: Request): Promise<Response> {
 
     if (!existing?.company_id) return new Response("OK", { status: 200, headers: corsHeaders });
     const credentials = await getTwilioCredentialMap(supabase, existing.company_id);
-    const signature = req.headers.get("x-twilio-signature") ?? "";
     const callbackUrl = Deno.env.get("TWILIO_RECORDING_CALLBACK_URL") || req.url;
-    if (!credentials.auth_token || !signature || !twilio.validateRequest(credentials.auth_token, signature, callbackUrl, callbackParams)) {
+    const valid = await validateTwilioWebhook(req, callbackParams, credentials, callbackUrl);
+    if (!valid) {
+      logTwilioRejection("invalid recording callback signature", req, callbackParams, credentials);
       return new Response("Forbidden", { status: 403, headers: corsHeaders });
     }
 
@@ -229,7 +291,10 @@ async function handleInboundStatusCallback(req: Request): Promise<Response> {
       credentials,
       Deno.env.get("TWILIO_INBOUND_STATUS_CALLBACK_URL") || undefined,
     );
-    if (!valid) return new Response("Forbidden", { status: 403, headers: corsHeaders });
+    if (!valid) {
+      logTwilioRejection("invalid inbound status signature", req, callbackParams, credentials);
+      return new Response("Forbidden", { status: 403, headers: corsHeaders });
+    }
 
     const dialStatus = callbackParams.DialCallStatus || callbackParams.CallStatus || "";
     const duration = parseInt(callbackParams.DialCallDuration || callbackParams.CallDuration || "0", 10);
@@ -306,7 +371,10 @@ async function handleTwimlWebhook(req: Request): Promise<Response> {
       companyId = inboundPhoneNumber?.company_id || "";
     }
 
-    if (!companyId) return new Response("Forbidden", { status: 403, headers: corsHeaders });
+    if (!companyId) {
+      logTwilioRejection("missing company context", req, webhookParams);
+      return new Response("Forbidden", { status: 403, headers: corsHeaders });
+    }
     const credentials = await getTwilioCredentialMap(supabase, companyId);
     const valid = await validateTwilioWebhook(
       req,
@@ -315,6 +383,7 @@ async function handleTwimlWebhook(req: Request): Promise<Response> {
       Deno.env.get("TWILIO_VOICE_WEBHOOK_URL") || undefined,
     );
     if (!valid) {
+      logTwilioRejection("invalid voice request signature", req, webhookParams, credentials);
       return new Response("Forbidden", { status: 403, headers: corsHeaders });
     }
 
@@ -486,7 +555,11 @@ Deno.serve(async (req: Request) => {
     };
 
     // Resolve company Twilio credentials
-    const requiredPermission = ["sync_numbers", "configure_inbound"].includes(action) ? "manage_phone_numbers" : "view_calls";
+    const requiredPermission = ["sync_numbers", "configure_inbound"].includes(action)
+      ? "manage_phone_numbers"
+      : action === "get_token"
+        ? ["view_calls", "view_acquisitions", "view_dispositions"]
+        : "view_calls";
     const authorizedUser = await authorizeUserRequest(req, supabase, company_id, user_id, requiredPermission);
     if (!authorizedUser) {
       return new Response(JSON.stringify({ error: "Not authorized" }), {
