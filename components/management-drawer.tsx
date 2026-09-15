@@ -17,11 +17,8 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import {
-  AlertDialog, AlertDialogAction, AlertDialogCancel,
-  AlertDialogContent, AlertDialogDescription, AlertDialogFooter,
-  AlertDialogHeader, AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { StageMoveDialog } from '@/components/stage-move-dialog';
+import { movePipelineStage } from '@/lib/utils/pipeline-stage';
 import {
   MapPin, User, DollarSign, Lock, Unlock, CheckCircle2,
   ArrowRight, Calendar, FileText,
@@ -57,7 +54,9 @@ export function ManagementDrawer({ recordId, companyId, userId, canEdit, stages,
   const [activity, setActivity] = useState<{ id: string; event_type: string; created_at: string; metadata: Record<string, unknown> }[]>([]);
   const [loading, setLoading] = useState(true);
   const [pendingStageId, setPendingStageId] = useState<string | null>(null);
-  const [showStageConfirm, setShowStageConfirm] = useState(false);
+  const [pendingStageRequestId, setPendingStageRequestId] = useState<string | null>(null);
+  const [stageMoveSaving, setStageMoveSaving] = useState(false);
+  const [stageMoveError, setStageMoveError] = useState('');
   const [lockingRevenue, setLockingRevenue] = useState(false);
   const [revenueInput, setRevenueInput] = useState('');
 
@@ -115,27 +114,35 @@ export function ManagementDrawer({ recordId, companyId, userId, canEdit, stages,
   const handleStageSelect = (stageId: string) => {
     if (!record || stageId === record.pipeline_stage_id) return;
     setPendingStageId(stageId);
-    setShowStageConfirm(true);
+    setPendingStageRequestId(crypto.randomUUID());
+    setStageMoveError('');
   };
 
-  const confirmStageChange = async () => {
-    if (!pendingStageId || !record) return;
-    const targetStage = stages.find((s) => s.id === pendingStageId);
-    await supabase.from('management_records').update({
-      pipeline_stage_id: pendingStageId,
-      stage_entered_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }).eq('id', record.id);
-    await supabase.from('activity_events').insert({
-      company_id: companyId, actor_id: userId,
-      entity_type: 'management_record', entity_id: record.id,
-      event_type: 'stage_changed',
-      metadata: { from_stage_id: record.pipeline_stage_id, to_stage_id: pendingStageId, to_stage_name: targetStage?.name },
-    });
-    setShowStageConfirm(false);
-    setPendingStageId(null);
-    onUpdated();
-    load();
+  const confirmStageChange = async (note: string) => {
+    if (!pendingStageId || !pendingStageRequestId || !record) return false;
+    setStageMoveSaving(true);
+    setStageMoveError('');
+    try {
+      const saved = await movePipelineStage<ManagementRecord>({
+        pipeline: 'management',
+        recordId: record.id,
+        expectedStageId: record.pipeline_stage_id,
+        toStageId: pendingStageId,
+        note,
+        requestId: pendingStageRequestId,
+      });
+      setRecord(saved);
+      setPendingStageId(null);
+      setPendingStageRequestId(null);
+      onUpdated();
+      await load();
+      return true;
+    } catch (error) {
+      setStageMoveError(error instanceof Error ? error.message : 'Unable to move the management record.');
+      return false;
+    } finally {
+      setStageMoveSaving(false);
+    }
   };
 
   const lockRevenue = async () => {
@@ -497,23 +504,21 @@ export function ManagementDrawer({ recordId, companyId, userId, canEdit, stages,
         </SheetContent>
       </Sheet>
 
-      {/* Stage change confirmation */}
-      <AlertDialog open={showStageConfirm} onOpenChange={setShowStageConfirm}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Move Management Stage?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Moving this record to <strong>{stages.find((s) => s.id === pendingStageId)?.name}</strong> may
-              trigger pipeline sync updates to the linked Acquisition or Disposition record.
-              This action will be logged.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => setPendingStageId(null)}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmStageChange}>Confirm Move</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <StageMoveDialog
+        key={pendingStageRequestId ?? 'closed-management-drawer-stage-move'}
+        open={!!pendingStageId}
+        fromStage={currentStage?.name ?? ''}
+        toStage={stages.find((stage) => stage.id === pendingStageId)?.name ?? ''}
+        requiresConfirmation
+        saving={stageMoveSaving}
+        error={stageMoveError}
+        onCancel={() => {
+          setPendingStageId(null);
+          setPendingStageRequestId(null);
+          setStageMoveError('');
+        }}
+        onConfirm={confirmStageChange}
+      />
     </>
   );
 }

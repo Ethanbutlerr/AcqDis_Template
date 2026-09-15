@@ -82,7 +82,7 @@ export default function CustomFieldsPage() {
   if (!canManage) {
     return (
       <div className="p-6">
-        <p className="text-sm text-muted-foreground">You don't have permission to manage custom fields.</p>
+        <p className="text-sm text-muted-foreground">You don&apos;t have permission to manage custom fields.</p>
       </div>
     );
   }

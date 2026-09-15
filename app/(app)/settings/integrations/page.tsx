@@ -243,7 +243,7 @@ function IntegrationsContent() {
               </li>
               <li>
                 <span className="text-foreground font-medium">Create a Campaign</span> -- Once your brand is approved, create an A2P Campaign. 
-                Select "Mixed" or "Marketing" use case. This takes 3-10 business days.
+                Select &quot;Mixed&quot; or &quot;Marketing&quot; use case. This takes 3-10 business days.
               </li>
               <li>
                 <span className="text-foreground font-medium">Get a phone number</span> -- Buy a local US number in Twilio and assign it to your approved Campaign.
@@ -289,7 +289,7 @@ function IntegrationsContent() {
               <Label htmlFor="twilioMsgSvc">Messaging Service SID <span className="text-muted-foreground text-[10px]">(optional)</span></Label>
               <Input id="twilioMsgSvc" placeholder="MGxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" value={twilioCreds.messaging_service_sid} onChange={(e) => setTwilioCreds((p) => ({ ...p, messaging_service_sid: e.target.value }))} />
               {existingTwilio.messaging_service_sid && !twilioCreds.messaging_service_sid && <p className="text-[11px] text-muted-foreground">Current: {maskValue(existingTwilio.messaging_service_sid)}</p>}
-              <p className="text-[10px] text-muted-foreground">If set, Twilio picks the sender from this service's number pool instead of using a single From number.</p>
+              <p className="text-[10px] text-muted-foreground">If set, Twilio picks the sender from this service&apos;s number pool instead of using a single From number.</p>
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="twilioTwiml">TwiML App SID <span className="text-muted-foreground text-[10px]">(for browser calling)</span></Label>
@@ -354,10 +354,10 @@ function IntegrationsContent() {
                 <span className="text-foreground font-medium">Verify your domain</span> -- Add the DNS records Resend provides. This proves you own the sending domain.
               </li>
               <li>
-                <span className="text-foreground font-medium">Generate an API key</span> -- Go to API Keys in your Resend dashboard and create one with "Sending access".
+                <span className="text-foreground font-medium">Generate an API key</span> -- Go to API Keys in your Resend dashboard and create one with &quot;Sending access&quot;.
               </li>
               <li>
-                <span className="text-foreground font-medium">Paste it below</span> -- That is it. Set your "From email" in the Company Branding section above.
+                <span className="text-foreground font-medium">Paste it below</span> -- That is it. Set your &quot;From email&quot; in the Company Branding section above.
               </li>
             </ol>
             <Button variant="outline" size="sm" asChild>
@@ -414,8 +414,8 @@ function IntegrationsContent() {
         <CardContent>
           <div className="space-y-3 text-sm">
             <WebhookUrlBlock
-              label="TwiML App Voice URL"
-              description='In Twilio Console > TwiML Apps > your app > Voice "Request URL" (HTTP POST). Required for browser calling.'
+              label="Twilio voice webhook"
+              description='Use this as the TwiML App Voice Request URL. Phone Numbers > Enable Incoming Calls connects the number to that app.'
               url={`${process.env.NEXT_PUBLIC_SUPABASE_URL || '[your-supabase-url]'}/functions/v1/voice-token`}
             />
             <WebhookUrlBlock

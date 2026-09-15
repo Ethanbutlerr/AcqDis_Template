@@ -3,10 +3,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
+import Image from 'next/image';
 import { useAuth } from '@/lib/auth/auth-context';
 import { usePermissions } from '@/lib/auth/use-permissions';
 import { useBranding, BrandingProvider } from '@/lib/auth/branding-context';
 import { ProtectedRoute } from '@/lib/auth/protected-route';
+import { PermissionGate } from '@/components/permission-gate';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
@@ -29,6 +31,7 @@ import dynamic from 'next/dynamic';
 
 const NotificationCenter = dynamic(() => import('@/components/notification-center').then(m => ({ default: m.NotificationCenter })), { ssr: false });
 const GlobalSearch = dynamic(() => import('@/components/global-search').then(m => ({ default: m.GlobalSearch })), { ssr: false });
+const IncomingCallListener = dynamic(() => import('@/components/incoming-call-listener').then(m => ({ default: m.IncomingCallListener })), { ssr: false });
 import { supabase } from '@/lib/supabase/client';
 import { cn } from '@/lib/utils';
 import type { AgencyCompanyAccess } from '@/lib/types';
@@ -75,6 +78,9 @@ export default function AppShellLayout({
 
 function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const routePermission = [...navItems, ...settingsItems].find(
+    (item) => pathname === item.href || pathname.startsWith(item.href + '/'),
+  )?.permission;
   const router = useRouter();
   const { profile, signOut, switchCompany, subscription } = useAuth();
   const { hasPermission } = usePermissions();
@@ -210,7 +216,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
       {/* Logo */}
       <div className={cn('flex items-center gap-2 border-b border-sidebar-border px-4 py-4', collapsed && 'justify-center')}>
         <div className="h-7 w-7 rounded overflow-hidden shrink-0 bg-[#110711]">
-          <img src="/ChatGPT_Image_Jul_31,_2026,_02_12_00_PM.png" alt="AcqDis" className="h-7 w-7 object-contain" />
+          <Image src="/ChatGPT_Image_Jul_31,_2026,_02_12_00_PM.png" alt="AcqDis" width={28} height={28} className="h-7 w-7 object-contain" />
         </div>
         {!collapsed && (
           <span className="text-sm font-semibold tracking-tight">AcqDis</span>
@@ -431,6 +437,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
             </DropdownMenuContent>
           </DropdownMenu>
 
+          <IncomingCallListener />
           <NotificationCenter />
         </header>
 
@@ -457,7 +464,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
         )}
 
         <main className="flex-1 overflow-y-auto">
-          {children}
+          <PermissionGate permission={routePermission}>{children}</PermissionGate>
         </main>
       </div>
     </div>

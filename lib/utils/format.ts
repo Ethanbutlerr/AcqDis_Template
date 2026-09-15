@@ -77,12 +77,23 @@ export function getInitials(name: string | null | undefined): string {
     .toUpperCase();
 }
 
+// Display cleanup only: never infer geography or use this as a duplicate key.
+export function cleanAddressPart(value: string | null | undefined): string {
+  if (!value) return '';
+  return value.split(',').map((part) => {
+    let text = part.trim().replace(/\s+/g, ' ');
+    if (/^\([^()]*\)$/.test(text)) text = text.slice(1, -1).trim();
+    text = text.replace(/(?:\s+(?:N\/?A))+$/i, '').trim();
+    return /^(?:N\/?A|NULL|UNDEFINED|\(\s*\))?$/i.test(text) ? '' : text;
+  }).filter(Boolean).join(', ');
+}
+
 export function fullAddress(p: {
   street_address: string;
   city?: string | null;
   state?: string | null;
   zip_code?: string | null;
 }): string {
-  const parts = [p.street_address, p.city, p.state, p.zip_code].filter(Boolean);
+  const parts = [p.street_address, p.city, p.state, p.zip_code].map(cleanAddressPart).filter(Boolean);
   return parts.join(', ');
 }

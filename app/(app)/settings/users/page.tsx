@@ -51,7 +51,7 @@ export default function UsersSettingsPage() {
 }
 
 function UsersSettings() {
-  const { profile } = useAuth();
+  const { profile, refreshProfile } = useAuth();
   const [users, setUsers] = useState<UserRow[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
   const [loading, setLoading] = useState(true);
@@ -65,6 +65,10 @@ function UsersSettings() {
   const [createSuccess, setCreateSuccess] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [roleTarget, setRoleTarget] = useState<UserRow | null>(null);
+  const [additionalRoleId, setAdditionalRoleId] = useState('');
+  const [addingRole, setAddingRole] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
 
   const loadUsers = useCallback(async () => {
     setLoading(true);
@@ -74,7 +78,7 @@ function UsersSettings() {
       .from('profiles')
       .select(`
         id, email, full_name, is_disabled, last_login_at,
-        user_roles!inner ( role_id )
+        user_roles ( role_id )
       `)
       .eq('company_id', profile!.company_id)
       .order('created_at', { ascending: true });
@@ -163,6 +167,29 @@ function UsersSettings() {
       setCreateError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setCreating(false);
+    }
+  };
+
+  const addRole = async () => {
+    if (!roleTarget || !profile || addingRole || !additionalRoleId) return;
+    if (!roles.some((role) => role.id === additionalRoleId && role.company_id === profile.company_id)) return;
+    setAddingRole(true);
+    setRoleError(null);
+    try {
+      const { error: insertError } = await supabase.from('user_roles').insert({
+        user_id: roleTarget.id,
+        role_id: additionalRoleId,
+      });
+      if (insertError) throw insertError;
+      await loadUsers();
+      if (roleTarget.id === profile.id) await refreshProfile();
+      setRoleTarget(null);
+      setAdditionalRoleId('');
+    } catch (err) {
+      setRoleError(err && typeof err === 'object' && 'message' in err
+        ? String(err.message) : 'Unable to add role. Please try again.');
+    } finally {
+      setAddingRole(false);
     }
   };
 
@@ -378,6 +405,11 @@ function UsersSettings() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" onClick={() => {
+                      setRoleTarget(u);
+                      setAdditionalRoleId('');
+                      setRoleError(null);
+                    }}>Add role</Button>
                     <Button
                       variant="ghost"
                       size="sm"
@@ -423,6 +455,36 @@ function UsersSettings() {
           )}
         </CardContent>
       </Card>
+
+      <Dialog open={!!roleTarget} onOpenChange={(open) => {
+        if (!open && !addingRole) setRoleTarget(null);
+      }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add role</DialogTitle>
+            <DialogDescription>
+              Add another role for {roleTarget?.full_name}. Access from all assigned roles combines; existing roles stay assigned.
+            </DialogDescription>
+          </DialogHeader>
+          {roleError && <p role="alert" className="text-sm text-destructive">{roleError}</p>}
+          <Label htmlFor="additionalRole">Additional role</Label>
+          <Select value={additionalRoleId} onValueChange={setAdditionalRoleId} disabled={addingRole}>
+            <SelectTrigger id="additionalRole"><SelectValue placeholder="Select a role" /></SelectTrigger>
+            <SelectContent>
+              {roles.filter((role) => !roleTarget?.roles.some((assigned) => assigned.id === role.id)).map((role) => (
+                <SelectItem key={role.id} value={role.id}>{role.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">The user should sign out and back in to load their updated access.</p>
+          <DialogFooter>
+            <Button variant="outline" disabled={addingRole} onClick={() => setRoleTarget(null)}>Cancel</Button>
+            <Button disabled={addingRole || !additionalRoleId} onClick={addRole}>
+              {addingRole ? 'Adding…' : 'Add role'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
         <AlertDialogContent>

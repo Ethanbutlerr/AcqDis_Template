@@ -19,9 +19,11 @@ interface BrowserCallDialogProps {
   companyId: string;
   conversationId?: string | null;
   contactId?: string | null;
+  acquisitionId?: string | null;
+  opportunityId?: string | null;
 }
 
-export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhone, companyId, conversationId, contactId }: BrowserCallDialogProps) {
+export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhone, companyId, conversationId, contactId, acquisitionId, opportunityId }: BrowserCallDialogProps) {
   const { profile } = useAuth();
   const [status, setStatus] = useState<CallStatus>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -31,9 +33,15 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
   const deviceRef = useRef<Device | null>(null);
   const callRef = useRef<Call | null>(null);
   const callStartRef = useRef<Date | null>(null);
+  const attemptRef = useRef(0);
+  const startingRef = useRef(false);
+  const loggedRef = useRef(false);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     return () => {
+      attemptRef.current += 1;
+      if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
       if (callRef.current) {
         try { callRef.current.disconnect(); } catch {}
@@ -54,7 +62,8 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
   }, [open]);
 
   const logCallToHistory = useCallback(async (duration: number, callStatus: 'completed' | 'no_answer' | 'failed') => {
-    if (!profile?.id) return;
+    if (!profile?.id || loggedRef.current) return;
+    loggedRef.current = true;
 
     const callDbStatus = callStatus === 'completed' ? 'answered' : callStatus === 'no_answer' ? 'missed' : 'failed';
 
@@ -63,6 +72,8 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
       company_id: companyId,
       conversation_id: conversationId || null,
       contact_id: contactId || null,
+      ...(acquisitionId ? { acquisition_record_id: acquisitionId } : {}),
+      ...(opportunityId ? { opportunity_id: opportunityId } : {}),
       assigned_user_id: profile.id,
       direction: 'outbound',
       status: callDbStatus,
@@ -85,23 +96,31 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
         last_call_at: new Date().toISOString(),
       }).eq('id', conversationId);
     }
-  }, [companyId, conversationId, contactId, contactPhone, profile?.id]);
+  }, [companyId, conversationId, contactId, contactPhone, profile?.id, acquisitionId, opportunityId]);
 
   const startCall = useCallback(async () => {
+    if (startingRef.current) return;
+    startingRef.current = true;
+    const attempt = ++attemptRef.current;
+    callStartRef.current = null;
+    loggedRef.current = false;
+    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
     setStatus('requesting_token');
     setError(null);
 
     try {
+      if (deviceRef.current) { deviceRef.current.destroy(); deviceRef.current = null; }
       // Check if the shared number is already in use by another user
       const { data: activeCalls } = await supabase
         .from('calls')
         .select('id, assigned_user_id')
         .eq('company_id', companyId)
         .eq('direction', 'outbound')
-        .eq('status', 'in-progress')
+        .eq('status', 'in_progress')
         .neq('assigned_user_id', profile?.id ?? '')
         .limit(1);
 
+      if (attempt !== attemptRef.current) return;
       if (activeCalls && activeCalls.length > 0) {
         setStatus('number_busy');
         setError('The phone line is currently in use by another team member. Please wait and try again in a moment.');
@@ -116,6 +135,7 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
         },
       });
 
+      if (attempt !== attemptRef.current) return;
       if (fnError || !data?.token) {
         setStatus('failed');
         setError(data?.error || fnError?.message || 'Failed to get voice token');
@@ -136,7 +156,9 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
         setError(err.message || 'Device error');
       });
 
-      await device.register();
+      // Outbound calls do not need device registration. The app shell owns the
+      // registered device used for incoming calls, avoiding duplicate listeners.
+      if (attempt !== attemptRef.current) { device.destroy(); return; }
       setStatus('connecting');
 
       const call = await device.connect({
@@ -148,6 +170,7 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
         },
       });
 
+      if (attempt !== attemptRef.current) { call.disconnect(); device.destroy(); return; }
       callRef.current = call;
 
       call.on('ringing', () => {
@@ -168,14 +191,14 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
           : 0;
         setStatus('ended');
         logCallToHistory(duration, duration > 0 ? 'completed' : 'no_answer');
-        setTimeout(() => onOpenChange(false), 1500);
+        closeTimerRef.current = setTimeout(() => onOpenChange(false), 1500);
       });
 
       call.on('cancel', () => {
         if (timerRef.current) clearInterval(timerRef.current);
         setStatus('ended');
         logCallToHistory(0, 'no_answer');
-        setTimeout(() => onOpenChange(false), 1500);
+        closeTimerRef.current = setTimeout(() => onOpenChange(false), 1500);
       });
 
       call.on('error', (err) => {
@@ -186,14 +209,19 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
       });
 
     } catch (err: unknown) {
+      if (attempt !== attemptRef.current) return;
       setStatus('failed');
       const msg = err instanceof Error ? err.message : 'Unknown error starting call';
       setError(msg);
       await logCallToHistory(0, 'failed');
+    } finally {
+      if (attempt === attemptRef.current) startingRef.current = false;
     }
   }, [companyId, contactPhone, profile?.id, onOpenChange, logCallToHistory]);
 
   const endCall = useCallback(() => {
+    attemptRef.current += 1;
+    startingRef.current = false;
     if (callRef.current) {
       try { callRef.current.disconnect(); } catch {}
     }
@@ -201,6 +229,7 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
       try { deviceRef.current.destroy(); } catch {}
       deviceRef.current = null;
     }
+    setStatus('ended');
   }, []);
 
   const toggleMute = useCallback(() => {
@@ -212,8 +241,9 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
   }, [muted]);
 
   const handleClose = () => {
-    if (status === 'connected' || status === 'ringing' || status === 'connecting') {
+    if (status === 'connected' || status === 'ringing' || status === 'connecting' || status === 'requesting_token') {
       endCall();
+      onOpenChange(false);
     } else {
       onOpenChange(false);
     }

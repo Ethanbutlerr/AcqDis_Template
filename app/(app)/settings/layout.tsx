@@ -13,13 +13,15 @@ import {
   ListPlus,
   Phone,
   Plug,
+  Columns3,
 } from 'lucide-react';
 
-const settingsNav = [
+const settingsNav: { href: string; label: string; icon: typeof Building2; permission?: string; anyPermission?: string[] }[] = [
   { href: '/settings/company', label: 'Company', icon: Building2, permission: 'manage_branding' },
   { href: '/settings/users', label: 'Users', icon: Users, permission: 'manage_users' },
   { href: '/settings/teams', label: 'Teams', icon: Network, permission: 'manage_teams' },
   { href: '/settings/roles', label: 'Roles', icon: Shield, permission: 'manage_roles' },
+  { href: '/settings/pipelines', label: 'Pipelines', icon: Columns3, anyPermission: ['edit_acquisitions', 'edit_dispositions'] },
   { href: '/settings/custom-fields', label: 'Custom Fields', icon: ListPlus, permission: 'manage_custom_fields' },
   { href: '/settings/phone-numbers', label: 'Phone Numbers', icon: Phone, permission: 'manage_phone_numbers' },
   { href: '/settings/integrations', label: 'Integrations', icon: Plug, permission: 'manage_branding' },
@@ -36,7 +38,8 @@ export default function SettingsLayout({
   const { hasPermission } = usePermissions();
 
   const visibleItems = settingsNav.filter(
-    (item) => !item.permission || hasPermission(item.permission),
+    (item) => (!item.permission || hasPermission(item.permission))
+      && (!item.anyPermission || item.anyPermission.some((permission) => hasPermission(permission))),
   );
 
   return (

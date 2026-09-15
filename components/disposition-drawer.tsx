@@ -1,8 +1,10 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/lib/supabase/client';
-import { formatRelativeTime } from '@/lib/utils/format';
+import { OpportunityContactEditor } from '@/components/opportunity-contact-editor';
+import { NotesSection } from '@/components/notes-section';
+import { formatRelativeTime, fullAddress, cleanAddressPart } from '@/lib/utils/format';
 import {
   DispositionRecord, DispositionPipelineStage, Contact, Property,
   AcquisitionRecord, BuyerOffer,
@@ -18,6 +20,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { MapPin, User, DollarSign, Calendar, CheckCircle2, Plus, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { StageMoveDialog } from '@/components/stage-move-dialog';
+import { movePipelineStage } from '@/lib/utils/pipeline-stage';
 
 interface Props {
   recordId: string;
@@ -51,10 +55,16 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
   const [offers, setOffers] = useState<BuyerOffer[]>([]);
   const [offerContacts, setOfferContacts] = useState<Record<string, Contact>>({});
   const [allContacts, setAllContacts] = useState<Contact[]>([]);
+  const [contactsLoading, setContactsLoading] = useState(false);
+  const [contactsError, setContactsError] = useState('');
+  const [contactsRetry, setContactsRetry] = useState(0);
   const [activity, setActivity] = useState<{ id: string; event_type: string; created_at: string; metadata: Record<string, unknown> }[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddOffer, setShowAddOffer] = useState(false);
   const [saving, setSaving] = useState(false);
+  const offerSaving = useRef(false);
+  const [offerError, setOfferError] = useState('');
+  const [saveMessage, setSaveMessage] = useState('');
   const [newOffer, setNewOffer] = useState({
     contact_id: '', offer_amount: '', financing_type: 'cash' as BuyerOffer['financing_type'],
     proof_of_funds_status: 'pending' as BuyerOffer['proof_of_funds_status'],
@@ -62,6 +72,10 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
     expiration_date: '', notes: '',
   });
   const [localRecord, setLocalRecord] = useState<Partial<DispositionRecord>>({});
+  const [pendingStageId, setPendingStageId] = useState<string | null>(null);
+  const [pendingStageRequestId, setPendingStageRequestId] = useState<string | null>(null);
+  const [stageMoveSaving, setStageMoveSaving] = useState(false);
+  const [stageMoveError, setStageMoveError] = useState('');
 
   const load = useCallback(async () => {
     if (!recordId || !companyId) return;
@@ -73,7 +87,7 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
     setRecord(r);
     setLocalRecord({});
 
-    const [sellerRes, propRes, acqRes, offersRes, actRes, contactsRes] = await Promise.all([
+    const [sellerRes, propRes, acqRes, offersRes, actRes] = await Promise.all([
       supabase.from('contacts').select('*').eq('id', r.contact_id).maybeSingle(),
       supabase.from('properties').select('*').eq('id', r.property_id).maybeSingle(),
       r.acquisition_record_id
@@ -81,7 +95,6 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
         : Promise.resolve({ data: null }),
       supabase.from('buyer_offers').select('*').eq('disposition_record_id', recordId).order('created_at', { ascending: false }),
       supabase.from('activity_events').select('*').eq('entity_id', recordId).order('created_at', { ascending: false }).limit(30),
-      supabase.from('contacts').select('id, first_name, last_name, primary_phone, primary_email').eq('company_id', companyId).order('first_name').limit(300),
     ]);
 
     setSeller(sellerRes.data as Contact ?? null);
@@ -90,9 +103,9 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
     const offerList = (offersRes.data ?? []) as BuyerOffer[];
     setOffers(offerList);
     setActivity(actRes.data ?? []);
-    setAllContacts((contactsRes.data ?? []) as Contact[]);
 
     const contactIds = Array.from(new Set(offerList.map((o) => o.contact_id)));
+    setOfferContacts({});
     if (contactIds.length > 0) {
       const { data: oc } = await supabase.from('contacts').select('*').in('id', contactIds);
       const m: Record<string, Contact> = {};
@@ -105,6 +118,31 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
 
   useEffect(() => { load(); }, [load]);
 
+  // The buyer picker is only needed while adding an offer, not on every field save.
+  useEffect(() => {
+    if (!showAddOffer || !companyId) return;
+    const controller = new AbortController();
+    setAllContacts([]);
+    setContactsLoading(true);
+    setContactsError('');
+    void (async () => {
+      try {
+        const { data, error } = await supabase.from('contacts')
+          .select('id, first_name, last_name, primary_phone, primary_email')
+          .eq('company_id', companyId).order('first_name').order('id').limit(300)
+          .abortSignal(controller.signal);
+        if (controller.signal.aborted) return;
+        if (error) throw error;
+        setAllContacts((data ?? []) as Contact[]);
+      } catch {
+        if (!controller.signal.aborted) setContactsError('Unable to load buyer contacts. Please retry.');
+      } finally {
+        if (!controller.signal.aborted) setContactsLoading(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [showAddOffer, companyId, contactsRetry]);
+
   const saveField = async (field: keyof DispositionRecord, value: unknown) => {
     if (!canEdit || !record) return;
     await supabase.from('disposition_records').update({ [field]: value, updated_at: new Date().toISOString() }).eq('id', record.id);
@@ -113,51 +151,91 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
   };
 
   const handleStageChange = async (stageId: string) => {
-    if (!record || !canEdit) return;
+    if (!record || !canEdit || stageId === record.pipeline_stage_id) return;
+    setPendingStageId(stageId);
+    setPendingStageRequestId(crypto.randomUUID());
+  };
+
+  const confirmStageChange = async (note: string) => {
+    if (!record || !pendingStageId || !pendingStageRequestId) return false;
+    const stageId = pendingStageId;
     const stage = stages.find((s) => s.id === stageId);
-    await supabase.from('disposition_records').update({
-      pipeline_stage_id: stageId,
-      stage_entered_at: new Date().toISOString(),
-      status: stage?.is_terminal && stage.name === 'Dead' ? 'dead' : stage?.is_terminal ? 'closed' : 'active',
-      updated_at: new Date().toISOString(),
-    }).eq('id', record.id);
-    await supabase.from('activity_events').insert({
-      company_id: companyId, actor_id: userId,
-      entity_type: 'disposition_record', entity_id: record.id,
-      event_type: 'stage_changed',
-      metadata: { from_stage_id: record.pipeline_stage_id, to_stage_id: stageId, to_stage_name: stage?.name },
-    });
+    if (!stage) return false;
+    setStageMoveSaving(true);
+    setStageMoveError('');
+    let savedRecord: DispositionRecord;
+    try {
+      savedRecord = await movePipelineStage<DispositionRecord>({
+        pipeline: 'disposition',
+        recordId: record.id,
+        expectedStageId: record.pipeline_stage_id,
+        toStageId: stageId,
+        note,
+        requestId: pendingStageRequestId,
+      });
+    } catch (error) {
+      setStageMoveError(error instanceof Error ? error.message : 'Unable to move deal.');
+      setStageMoveSaving(false);
+      await load();
+      return false;
+    }
+    setRecord(savedRecord);
+    setStageMoveSaving(false);
+    setPendingStageId(null);
+    setPendingStageRequestId(null);
     onUpdated();
-    load();
+    await load();
+    return true;
   };
 
   const addOffer = async () => {
-    if (!newOffer.contact_id || !newOffer.offer_amount || !record) return;
+    if (!canEdit || offerSaving.current || !newOffer.contact_id || !newOffer.offer_amount || !record) return;
+    const amount = Number(newOffer.offer_amount);
+    const deposit = newOffer.emd_amount.trim() ? Number(newOffer.emd_amount) : null;
+    if (!Number.isFinite(amount) || amount <= 0 || (deposit !== null && (!Number.isFinite(deposit) || deposit < 0))) {
+      setOfferError('Enter an offer amount greater than zero and a non-negative deposit.');
+      return;
+    }
+    offerSaving.current = true;
     setSaving(true);
-    await supabase.from('buyer_offers').insert({
+    setOfferError('');
+    setSaveMessage('');
+    try {
+    const { data: savedOffer, error: offerSaveError } = await supabase.from('buyer_offers').insert({
       company_id: companyId,
       disposition_record_id: record.id,
       contact_id: newOffer.contact_id,
-      offer_amount: parseFloat(newOffer.offer_amount),
+      offer_amount: amount,
       financing_type: newOffer.financing_type,
       proof_of_funds_status: newOffer.proof_of_funds_status,
-      emd_amount: newOffer.emd_amount ? parseFloat(newOffer.emd_amount) : null,
+      emd_amount: deposit,
       offer_date: newOffer.offer_date,
       expiration_date: newOffer.expiration_date || null,
       notes: newOffer.notes || null,
       status: 'pending',
-    });
-    await supabase.from('activity_events').insert({
+    }).select('id').single();
+    if (offerSaveError || !savedOffer) throw new Error('Offer could not be confirmed. Your entries are preserved; check the offer list before retrying.');
+    try {
+    const { error: activityError } = await supabase.from('activity_events').insert({
       company_id: companyId, actor_id: userId,
       entity_type: 'disposition_record', entity_id: record.id,
       event_type: 'buyer_offer_added',
       metadata: { contact_id: newOffer.contact_id, offer_amount: newOffer.offer_amount },
     });
+    if (activityError) throw activityError;
+    } catch {
+      setSaveMessage('Offer saved, but the activity entry could not be recorded. Do not submit it again.');
+    }
     setShowAddOffer(false);
     setNewOffer({ contact_id: '', offer_amount: '', financing_type: 'cash', proof_of_funds_status: 'pending', emd_amount: '', offer_date: new Date().toISOString().slice(0, 10), expiration_date: '', notes: '' });
-    setSaving(false);
     onUpdated();
-    load();
+    void load();
+    } catch (error) {
+      setOfferError(error instanceof Error ? error.message : 'Offer could not be confirmed. Check the offer list before retrying.');
+    } finally {
+      offerSaving.current = false;
+      setSaving(false);
+    }
   };
 
   const acceptOffer = async (offer: BuyerOffer) => {
@@ -196,7 +274,7 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <SheetTitle className="text-lg font-semibold truncate">
-                  {property?.street_address ?? 'Disposition'}
+                  {cleanAddressPart(property?.street_address) || 'Opportunity'}
                 </SheetTitle>
                 {property && (
                   <p className="text-sm text-muted-foreground flex items-center gap-1 mt-0.5">
@@ -230,11 +308,14 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
                 </SelectContent>
               </Select>
             )}
+            {stageMoveError && <p role="alert" className="mt-2 text-sm text-destructive">{stageMoveError}</p>}
           </SheetHeader>
+          {saveMessage && <p role="status" className="px-6 pt-3 text-sm text-muted-foreground">{saveMessage}</p>}
 
           <Tabs defaultValue="overview" className="flex-1 flex flex-col min-h-0">
             <TabsList className="mx-6 mt-3 mb-0 w-auto justify-start shrink-0">
-              <TabsTrigger value="overview">Overview</TabsTrigger>
+              <TabsTrigger value="overview">Opportunity Details</TabsTrigger>
+              <TabsTrigger value="notes">Notes</TabsTrigger>
               <TabsTrigger value="offers">
                 Buyer Offers
                 {offers.length > 0 && <Badge variant="secondary" className="ml-1.5 text-[10px] h-4 px-1">{offers.length}</Badge>}
@@ -244,6 +325,27 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
 
             {/* Overview */}
             <TabsContent value="overview" className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+              <section className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Contact Information</h3>
+                  {seller && <OpportunityContactEditor key={seller.id} contact={seller} companyId={companyId} onSaved={(updated) => {
+                    setSeller(updated);
+                    onUpdated();
+                  }} />}
+                </div>
+                {seller ? <div className="space-y-1 text-sm">
+                  <p className="font-medium">{[seller.first_name, seller.last_name].filter(Boolean).join(' ') || seller.company_name || 'Unnamed contact'}</p>
+                  <p className="text-muted-foreground">{seller.primary_phone || 'No phone number'}</p>
+                  <p className="text-muted-foreground">{seller.primary_email || 'No email address'}</p>
+                </div> : <p className="text-sm text-muted-foreground">No linked contact.</p>}
+              </section>
+              <section className="space-y-2 border-t pt-4">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Opportunity Information</h3>
+                <p className="text-sm">{property && fullAddress(property) || 'No property address'}</p>
+                <p className="text-sm text-muted-foreground">Stage: {currentStage?.name || 'Not assigned'}</p>
+                {acquisition?.lead_source && <p className="text-sm text-muted-foreground">Source: {acquisition.lead_source}</p>}
+              </section>
+              <h3 className="border-t pt-4 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Contract Information</h3>
               {/* Key financials */}
               <div className="grid grid-cols-3 gap-3">
                 <div className="rounded-lg border bg-card p-3">
@@ -308,26 +410,25 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
                       className="h-8 text-sm" disabled={!canEdit} />
                   </div>
                 </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">Notes</Label>
-                  <Textarea
-                    defaultValue={record.notes ?? ''}
-                    onBlur={(e) => saveField('notes', e.target.value || null)}
-                    rows={3} className="text-sm resize-none" disabled={!canEdit} />
-                </div>
               </div>
 
-              {/* Linked people */}
-              <div className="space-y-2">
-                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">People</p>
-                {seller && (
-                  <div className="flex items-center gap-2 text-sm">
-                    <User className="h-4 w-4 text-muted-foreground shrink-0" />
-                    <span className="font-medium">Seller:</span>
-                    <span>{seller.first_name} {seller.last_name}</span>
-                    {seller.primary_phone && <span className="text-muted-foreground">· {seller.primary_phone}</span>}
-                  </div>
-                )}
+            </TabsContent>
+
+            <TabsContent value="notes" className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+              <NotesSection
+                entityType="disposition_record"
+                entityId={record.id}
+                companyId={companyId}
+                relatedEntities={[
+                  { entityType: 'opportunity', entityId: record.opportunity_id, label: 'Opportunity' },
+                  { entityType: 'contact', entityId: record.contact_id, label: 'Contact' },
+                  ...(record.acquisition_record_id ? [{ entityType: 'acquisition_record', entityId: record.acquisition_record_id, label: 'Acquisition' }] : []),
+                ]}
+              />
+              <div className="space-y-1 border-t pt-4">
+                <Label className="text-xs">Existing disposition notes</Label>
+                <p className="text-xs text-muted-foreground">Earlier notes are preserved here. Use the note box above for author and time tracking.</p>
+                <Textarea defaultValue={record.notes ?? ''} onBlur={(e) => saveField('notes', e.target.value || null)} rows={3} className="text-sm resize-none" disabled={!canEdit} />
               </div>
             </TabsContent>
 
@@ -426,14 +527,18 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
 
       {/* Add Offer Dialog */}
       {showAddOffer && (
-        <Dialog open onOpenChange={() => setShowAddOffer(false)}>
+        <Dialog open onOpenChange={(open) => { if (!open && !offerSaving.current) setShowAddOffer(false); }}>
           <DialogContent className="max-w-md">
             <DialogHeader><DialogTitle>Add Buyer Offer</DialogTitle></DialogHeader>
+            {offerError && <p role="alert" className="text-sm text-destructive">{offerError}</p>}
+            {contactsError && <div role="alert" className="text-sm text-destructive">
+              {contactsError} <Button variant="outline" size="sm" onClick={() => setContactsRetry((value) => value + 1)}>Retry</Button>
+            </div>}
             <div className="space-y-3 py-2">
               <div className="space-y-1">
                 <Label className="text-xs">Buyer Contact *</Label>
-                <Select value={newOffer.contact_id} onValueChange={(v) => setNewOffer({ ...newOffer, contact_id: v })}>
-                  <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Select buyer..." /></SelectTrigger>
+                <Select value={newOffer.contact_id} onValueChange={(v) => setNewOffer({ ...newOffer, contact_id: v })} disabled={contactsLoading || !!contactsError}>
+                  <SelectTrigger className="h-8 text-sm"><SelectValue placeholder={contactsLoading ? 'Loading buyers…' : 'Select buyer...'} /></SelectTrigger>
                   <SelectContent>
                     {allContacts.map((c) => (
                       <SelectItem key={c.id} value={c.id}>{c.first_name} {c.last_name}</SelectItem>
@@ -487,13 +592,24 @@ export function DispositionDrawer({ recordId, companyId, userId, canEdit, stages
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setShowAddOffer(false)}>Cancel</Button>
-              <Button onClick={addOffer} disabled={saving || !newOffer.contact_id || !newOffer.offer_amount}>
+              <Button variant="outline" disabled={saving} onClick={() => setShowAddOffer(false)}>Cancel</Button>
+              <Button onClick={addOffer} disabled={saving || contactsLoading || !!contactsError || !allContacts.some((contact) => contact.id === newOffer.contact_id) || !newOffer.offer_amount}>
                 {saving ? 'Adding…' : 'Add Offer'}
               </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
+      )}
+      {pendingStageId && record && (
+        <StageMoveDialog
+          open
+          fromStage={currentStage?.name ?? 'Unknown stage'}
+          toStage={stages.find((stage) => stage.id === pendingStageId)?.name ?? 'Selected stage'}
+          saving={stageMoveSaving}
+          error={stageMoveError}
+          onCancel={() => { setPendingStageId(null); setPendingStageRequestId(null); }}
+          onConfirm={confirmStageChange}
+        />
       )}
     </>
   );

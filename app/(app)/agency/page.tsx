@@ -132,7 +132,7 @@ export default function AgencyDashboardPage() {
             <DialogHeader>
               <DialogTitle>Create sub-account</DialogTitle>
               <DialogDescription>
-                Create a new company workspace. You'll be able to switch into it and manage it from here.
+                Create a new company workspace. You&apos;ll be able to switch into it and manage it from here.
                 New accounts start with a 7-day free trial.
               </DialogDescription>
             </DialogHeader>

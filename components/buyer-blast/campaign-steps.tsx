@@ -394,7 +394,7 @@ export function ScheduleStep({
       }
     };
     load();
-  }, [companyId]);
+  }, [companyId, config.dailyLimit, config.frequencyCapHours, config.quietHoursEnd, config.quietHoursStart, config.senderNumberId]);
 
   useEffect(() => {
     const senderPhone = phoneNumbers.find((p) => p.id === senderNumberId);

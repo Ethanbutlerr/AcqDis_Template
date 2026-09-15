@@ -4,7 +4,8 @@ import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '@/lib/supabase/client';
 import { useAuth } from '@/lib/auth/auth-context';
 import { usePermissions } from '@/lib/auth/use-permissions';
-import { formatRelativeTime } from '@/lib/utils/format';
+import { formatRelativeTime, cleanAddressPart } from '@/lib/utils/format';
+import { movePipelineStage } from '@/lib/utils/pipeline-stage';
 import {
   DispositionRecord, DispositionPipelineStage, Contact, Property,
   AcquisitionRecord, BuyerOffer,
@@ -15,6 +16,9 @@ import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { DispositionDrawer } from '@/components/disposition-drawer';
+import { StageMoveDialog } from '@/components/stage-move-dialog';
+import { CreateOpportunityDialog } from '@/components/create-opportunity-dialog';
+import { DuplicateReviewDialog } from '@/components/duplicate-review-dialog';
 import { Search, Plus, MoreHorizontal, MapPin, Clock, DollarSign, User, Archive, MessageSquareMore } from 'lucide-react';
 import { BuyerBlastWizard } from '@/components/buyer-blast/buyer-blast-wizard';
 import { cn } from '@/lib/utils';
@@ -33,7 +37,9 @@ function timeInStage(enteredAt: string) {
 export default function DispositionsPage() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
-  const canEdit = hasPermission('edit_contacts') || hasPermission('assign_leads');
+  const canEdit = hasPermission('edit_dispositions');
+  const canCreateAcquisition = hasPermission('edit_acquisitions') || hasPermission('edit_acquisition_records');
+  const canViewAllDeals = !!profile?.is_agency_admin || hasPermission('view_all_disposition_deals');
   const companyId = profile?.company_id ?? null;
 
   const [stages, setStages] = useState<DispositionPipelineStage[]>([]);
@@ -48,18 +54,30 @@ export default function DispositionsPage() {
   const [filterStage, setFilterStage] = useState('all');
   const [drawerRecordId, setDrawerRecordId] = useState<string | null>(null);
   const [showBlast, setShowBlast] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
   const [blastDispositionId, setBlastDispositionId] = useState<string | null>(null);
+  const [pendingStageMove, setPendingStageMove] = useState<{ recordId: string; toStageId: string; fromStage: string; toStage: string; requestId: string } | null>(null);
+  const [stageMoveSaving, setStageMoveSaving] = useState(false);
+  const [moveError, setMoveError] = useState('');
+  const [pendingDuplicateCount, setPendingDuplicateCount] = useState(0);
+  const [showDuplicateReview, setShowDuplicateReview] = useState(false);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!companyId) return;
     if (showSpinner) setLoading(true);
 
-    const [stagesRes, recordsRes] = await Promise.all([
-      supabase.from('disposition_pipeline_stages').select('*').eq('company_id', companyId).order('position'),
-      supabase.from('disposition_records').select('*').eq('company_id', companyId).eq('status', 'active').order('created_at', { ascending: false }),
-    ]);
-
+    const stagesRes = await supabase.from('disposition_pipeline_stages').select('*').eq('company_id', companyId).order('position');
     const stageList = (stagesRes.data ?? []) as DispositionPipelineStage[];
+    let recordsQuery = supabase.from('disposition_records').select('*').eq('company_id', companyId).eq('status', 'active').order('created_at', { ascending: false });
+    if (!canViewAllDeals && profile?.id) {
+      const newLeadStageId = stageList.find((stage) => stage.stage_key === 'new_lead')?.id ?? stageList[0]?.id;
+      const visibilityFilter = newLeadStageId
+        ? `assigned_user_id.eq.${profile.id},and(assigned_user_id.is.null,pipeline_stage_id.eq.${newLeadStageId})`
+        : `assigned_user_id.eq.${profile.id}`;
+      recordsQuery = recordsQuery.or(visibilityFilter);
+    }
+    const recordsRes = await recordsQuery;
+
     const recordList = (recordsRes.data ?? []) as DispositionRecord[];
     setStages(stageList);
 
@@ -97,6 +115,16 @@ export default function DispositionsPage() {
     setOfferCounts(counts);
     setAcceptedOffers(accepted);
 
+    if (canViewAllDeals) {
+      const { count } = await supabase.from('opportunity_duplicate_reviews')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', companyId)
+        .eq('status', 'pending');
+      setPendingDuplicateCount(count ?? 0);
+    } else {
+      setPendingDuplicateCount(0);
+    }
+
     let filtered = recordList;
     if (filterStage !== 'all') filtered = filtered.filter((r) => r.pipeline_stage_id === filterStage);
     if (search) {
@@ -114,96 +142,91 @@ export default function DispositionsPage() {
     }
     setRecords(filtered);
     setLoading(false);
-  }, [companyId, filterStage, search]);
+  }, [canViewAllDeals, companyId, filterStage, profile?.id, search]);
 
   useEffect(() => { load(); }, [load]);
 
-  const handleDrop = async (e: React.DragEvent, stageId: string) => {
-    e.preventDefault();
+  const requestStageMove = (recordId: string, stageId: string) => {
     if (!companyId || !canEdit) return;
-    const recordId = e.dataTransfer.getData('text/plain');
     const record = records.find((r) => r.id === recordId);
     if (!record || record.pipeline_stage_id === stageId) return;
     const stage = stages.find((s) => s.id === stageId);
-
-    await supabase.from('disposition_records').update({
-      pipeline_stage_id: stageId,
-      stage_entered_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      status: stage?.is_terminal && stage.name === 'Dead' ? 'dead' : stage?.is_terminal ? 'closed' : 'active',
-    }).eq('id', recordId);
-
-    await supabase.from('activity_events').insert({
-      company_id: companyId,
-      actor_id: profile?.id ?? null,
-      entity_type: 'disposition_record',
-      entity_id: recordId,
-      event_type: 'stage_changed',
-      metadata: { from_stage_id: record.pipeline_stage_id, to_stage_id: stageId, to_stage_name: stage?.name },
+    const fromStage = stages.find((s) => s.id === record.pipeline_stage_id);
+    if (!stage) return;
+    setPendingStageMove({
+      recordId,
+      toStageId: stageId,
+      fromStage: fromStage?.name ?? 'Unknown stage',
+      toStage: stage.name,
+      requestId: crypto.randomUUID(),
     });
-
-    // Trigger pipeline sync check
-    await triggerPipelineSync(recordId, 'disposition', record.pipeline_stage_id, stageId, companyId);
-
-    setRecords((prev) => prev.map((r) => r.id === recordId ? { ...r, pipeline_stage_id: stageId, stage_entered_at: new Date().toISOString(), updated_at: new Date().toISOString() } : r));
   };
 
-  async function triggerPipelineSync(entityId: string, pipeline: string, fromStageId: string, toStageId: string, coId: string) {
-    const { data: mappings } = await supabase
-      .from('pipeline_stage_mappings')
-      .select('*')
-      .eq('company_id', coId)
-      .eq('source_pipeline', pipeline)
-      .eq('source_stage_id', toStageId)
-      .eq('is_active', true);
+  const handleDrop = async (e: React.DragEvent, stageId: string) => {
+    e.preventDefault();
+    requestStageMove(e.dataTransfer.getData('text/plain'), stageId);
+  };
 
-    if (!mappings || mappings.length === 0) return;
+  const confirmStageMove = async (note: string) => {
+    if (!companyId || !pendingStageMove) return false;
+    const { recordId, toStageId: stageId } = pendingStageMove;
+    const record = records.find((r) => r.id === recordId);
+    const stage = stages.find((s) => s.id === stageId);
+    if (!record || !stage) return false;
+    setStageMoveSaving(true);
+    setMoveError('');
 
-    for (const mapping of mappings) {
-      const iKey = `${pipeline}_${entityId}_to_${mapping.target_pipeline}_${toStageId}`;
-      const { error: conflictErr } = await supabase.from('synchronization_events').insert({
-        company_id: coId,
-        entity_type: 'disposition_record',
-        entity_id: entityId,
-        source_pipeline: pipeline,
-        target_pipeline: mapping.target_pipeline,
-        idempotency_key: iKey,
-        result: 'success',
+    let savedRecord: DispositionRecord;
+    try {
+      savedRecord = await movePipelineStage<DispositionRecord>({
+        pipeline: 'disposition',
+        recordId,
+        expectedStageId: record.pipeline_stage_id,
+        toStageId: stageId,
+        note,
+        requestId: pendingStageMove.requestId,
       });
-      if (conflictErr) continue; // already processed
-
-      const actions = mapping.actions as Record<string, unknown>;
-      if (actions.update_stage && mapping.target_pipeline === 'management') {
-        // Find the management record for this entity's opportunity
-        const dispRecord = records.find((r) => r.id === entityId);
-        if (dispRecord) {
-          await supabase.from('management_records')
-            .update({
-              pipeline_stage_id: mapping.target_stage_id,
-              stage_entered_at: new Date().toISOString(),
-              disposition_stage_snapshot: stages.find((s) => s.id === toStageId)?.name ?? null,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('opportunity_id', dispRecord.opportunity_id);
-        }
-      }
+    } catch (error) {
+      setMoveError(error instanceof Error ? error.message : 'Unable to move deal.');
+      setStageMoveSaving(false);
+      await load(false);
+      return false;
     }
-  }
+
+    setRecords((prev) => prev.map((r) => r.id === recordId ? savedRecord : r));
+    setStageMoveSaving(false);
+    setPendingStageMove(null);
+    return true;
+  };
 
   const recordsByStage = (stageId: string) => records.filter((r) => r.pipeline_stage_id === stageId);
 
   return (
     <div className="flex flex-col h-full animate-in">
+      {moveError && <p role="alert" className="px-6 pt-3 text-sm text-destructive">{moveError}</p>}
       <div className="flex items-center justify-between px-6 py-4 border-b border-border">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Dispositions</h1>
           <p className="text-sm text-muted-foreground">{records.length} active deals · {stages.length} stages</p>
         </div>
-        {hasPermission('send_buyer_sms_campaigns') && (
-          <Button variant="outline" size="sm" className="gap-1.5" onClick={() => { setBlastDispositionId(null); setShowBlast(true); }}>
-            <MessageSquareMore className="h-4 w-4" /> SMS Blast Buyers
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {canViewAllDeals && pendingDuplicateCount > 0 && (
+            <Button variant="outline" size="sm" className="gap-1.5" onClick={() => setShowDuplicateReview(true)}>
+              <Archive className="h-4 w-4 text-amber-600" /> Review Repeats
+              <Badge variant="secondary" className="ml-1">{pendingDuplicateCount}</Badge>
+            </Button>
+          )}
+          {hasPermission('send_buyer_sms_campaigns') && (
+            <Button variant="outline" size="sm" className="gap-1.5" onClick={() => { setBlastDispositionId(null); setShowBlast(true); }}>
+              <MessageSquareMore className="h-4 w-4" /> SMS Blast Buyers
+            </Button>
+          )}
+          {canEdit && (
+            <Button size="sm" className="gap-1.5" onClick={() => setShowCreate(true)}>
+              <Plus className="h-4 w-4" /> New Opportunity
+            </Button>
+          )}
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center gap-2 px-6 py-3 border-b border-border">
@@ -258,7 +281,7 @@ export default function DispositionsPage() {
                         >
                           <div className="flex items-start justify-between gap-1">
                             <p className="text-sm font-medium leading-tight truncate flex-1">
-                              {property?.street_address ?? 'No address'}
+                              {cleanAddressPart(property?.street_address) || 'No address'}
                             </p>
                             <DropdownMenu>
                               <DropdownMenuTrigger asChild>
@@ -273,7 +296,12 @@ export default function DispositionsPage() {
                                     <MessageSquareMore className="mr-2 h-3.5 w-3.5" /> SMS Blast for this Deal
                                   </DropdownMenuItem>
                                 )}
-                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); supabase.from('disposition_records').update({ status: 'dead', updated_at: new Date().toISOString() }).eq('id', record.id).then(() => load(false)); }}>
+                                <DropdownMenuItem onClick={(e) => {
+                                  e.stopPropagation();
+                                  const deadStage = stages.find((candidate) => candidate.stage_key === 'dead');
+                                  if (deadStage) requestStageMove(record.id, deadStage.id);
+                                  else setMoveError('The Dead stage is not configured for this company.');
+                                }}>
                                   <Archive className="mr-2 h-3.5 w-3.5" /> Mark Dead
                                 </DropdownMenuItem>
                               </DropdownMenuContent>
@@ -363,6 +391,18 @@ export default function DispositionsPage() {
         />
       )}
 
+      {pendingStageMove && (
+        <StageMoveDialog
+          open
+          fromStage={pendingStageMove.fromStage}
+          toStage={pendingStageMove.toStage}
+          saving={stageMoveSaving}
+          error={moveError}
+          onCancel={() => setPendingStageMove(null)}
+          onConfirm={confirmStageMove}
+        />
+      )}
+
       {showBlast && companyId && (
         <BuyerBlastWizard
           open={showBlast}
@@ -370,6 +410,28 @@ export default function DispositionsPage() {
           userId={profile?.id ?? null}
           defaultDispositionId={blastDispositionId}
           onClose={() => { setShowBlast(false); setBlastDispositionId(null); }}
+        />
+      )}
+
+      {showCreate && companyId && (
+        <CreateOpportunityDialog
+          open
+          companyId={companyId}
+          defaultPipeline="disposition"
+          canCreateAcquisition={canCreateAcquisition}
+          canCreateDisposition={canEdit}
+          onClose={() => setShowCreate(false)}
+          onCreated={() => { setShowCreate(false); void load(); }}
+        />
+      )}
+
+      {showDuplicateReview && companyId && (
+        <DuplicateReviewDialog
+          open
+          companyId={companyId}
+          userId={profile?.id ?? null}
+          onClose={() => setShowDuplicateReview(false)}
+          onChanged={() => setPendingDuplicateCount((count) => Math.max(0, count - 1))}
         />
       )}
     </div>

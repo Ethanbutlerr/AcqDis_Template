@@ -14,6 +14,8 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { ManagementDrawer } from '@/components/management-drawer';
+import { StageMoveDialog } from '@/components/stage-move-dialog';
+import { movePipelineStage } from '@/lib/utils/pipeline-stage';
 import { Search, Lock, MapPin, ArrowRight, MoreHorizontal, Clock } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
@@ -27,22 +29,8 @@ export default function ManagementPage() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
   const companyId = profile?.company_id ?? null;
-
-  // Gate: only management users can see this page
-  if (!hasPermission('view_management')) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-3 text-center p-8">
-        <Lock className="h-10 w-10 text-muted-foreground" />
-        <h2 className="text-xl font-semibold">Access Restricted</h2>
-        <p className="text-sm text-muted-foreground max-w-sm">
-          The Management pipeline is only accessible to authorized management users.
-          Contact your administrator to request access.
-        </p>
-      </div>
-    );
-  }
-
-  const canEdit = hasPermission('edit_management') || hasPermission('assign_leads');
+  const canView = hasPermission('view_management');
+  const canEdit = !!profile?.is_agency_admin || hasPermission('edit_management');
 
   const [stages, setStages] = useState<ManagementPipelineStage[]>([]);
   const [records, setRecords] = useState<ManagementRecord[]>([]);
@@ -54,9 +42,19 @@ export default function ManagementPage() {
   const [search, setSearch] = useState('');
   const [filterStage, setFilterStage] = useState('all');
   const [drawerRecordId, setDrawerRecordId] = useState<string | null>(null);
+  const [pendingMove, setPendingMove] = useState<{
+    recordId: string;
+    fromStageId: string;
+    fromStage: string;
+    toStageId: string;
+    toStage: string;
+    requestId: string;
+  } | null>(null);
+  const [moveSaving, setMoveSaving] = useState(false);
+  const [moveError, setMoveError] = useState('');
 
   const load = useCallback(async () => {
-    if (!companyId) return;
+    if (!companyId || !canView) return;
     setLoading(true);
 
     const [stagesRes, recordsRes] = await Promise.all([
@@ -129,7 +127,7 @@ export default function ManagementPage() {
     }
     setRecords(filtered);
     setLoading(false);
-  }, [companyId, filterStage, search]);
+  }, [canView, companyId, filterStage, search]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -139,23 +137,59 @@ export default function ManagementPage() {
     const recordId = e.dataTransfer.getData('text/plain');
     const record = records.find((r) => r.id === recordId);
     if (!record || record.pipeline_stage_id === stageId) return;
-    await supabase.from('management_records').update({
-      pipeline_stage_id: stageId,
-      stage_entered_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }).eq('id', recordId);
-    await supabase.from('activity_events').insert({
-      company_id: companyId,
-      actor_id: profile?.id ?? null,
-      entity_type: 'management_record',
-      entity_id: recordId,
-      event_type: 'stage_changed',
-      metadata: { from_stage_id: record.pipeline_stage_id, to_stage_id: stageId },
+    const fromStage = stages.find((stage) => stage.id === record.pipeline_stage_id);
+    const toStage = stages.find((stage) => stage.id === stageId);
+    if (!fromStage || !toStage) return;
+    setMoveError('');
+    setPendingMove({
+      recordId,
+      fromStageId: fromStage.id,
+      fromStage: fromStage.name,
+      toStageId: toStage.id,
+      toStage: toStage.name,
+      requestId: crypto.randomUUID(),
     });
-    load();
+  };
+
+  const confirmStageMove = async (note: string) => {
+    if (!pendingMove) return false;
+    setMoveSaving(true);
+    setMoveError('');
+    try {
+      const saved = await movePipelineStage<ManagementRecord>({
+        pipeline: 'management',
+        recordId: pendingMove.recordId,
+        expectedStageId: pendingMove.fromStageId,
+        toStageId: pendingMove.toStageId,
+        note,
+        requestId: pendingMove.requestId,
+      });
+      setRecords((current) => current.map((record) => record.id === saved.id ? saved : record));
+      setPendingMove(null);
+      await load();
+      return true;
+    } catch (error) {
+      setMoveError(error instanceof Error ? error.message : 'Unable to move the management record.');
+      return false;
+    } finally {
+      setMoveSaving(false);
+    }
   };
 
   const recordsByStage = (stageId: string) => records.filter((r) => r.pipeline_stage_id === stageId);
+
+  if (!canView) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-3 text-center p-8">
+        <Lock className="h-10 w-10 text-muted-foreground" />
+        <h2 className="text-xl font-semibold">Access Restricted</h2>
+        <p className="text-sm text-muted-foreground max-w-sm">
+          The Management pipeline is only accessible to authorized management users.
+          Contact your administrator to request access.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full animate-in">
@@ -300,6 +334,17 @@ export default function ManagementPage() {
           onUpdated={load}
         />
       )}
+      <StageMoveDialog
+        key={pendingMove?.requestId ?? 'closed-management-stage-move'}
+        open={!!pendingMove}
+        fromStage={pendingMove?.fromStage ?? ''}
+        toStage={pendingMove?.toStage ?? ''}
+        requiresConfirmation
+        saving={moveSaving}
+        error={moveError}
+        onCancel={() => { setPendingMove(null); setMoveError(''); }}
+        onConfirm={confirmStageMove}
+      />
     </div>
   );
 }

@@ -442,7 +442,7 @@ export function UploadImportStep({ companyId, onComplete }: UploadStepProps) {
         {!Object.values(mapping).includes('phone') && (
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
-            <AlertDescription>You must map a column to "Phone Number" before continuing.</AlertDescription>
+            <AlertDescription>You must map a column to &quot;Phone Number&quot; before continuing.</AlertDescription>
           </Alert>
         )}
 

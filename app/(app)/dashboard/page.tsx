@@ -397,7 +397,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
           <p className="text-sm text-muted-foreground">
-            Welcome back, {firstName}. Here's what's happening at {company?.name ?? 'your company'}.
+            Welcome back, {firstName}. Here&apos;s what&apos;s happening at {company?.name ?? 'your company'}.
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">

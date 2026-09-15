@@ -26,10 +26,10 @@ export default function ConversationsPage() {
   const { hasPermission } = usePermissions();
   const companyId = profile?.company_id ?? null;
   const deepLinkHandled = useRef(false);
+  const opportunityRequest = useRef(0);
 
   const [conversations, setConversations] = useState<ConversationWithContact[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [contacts, setContacts] = useState<Record<string, Contact>>({});
   const [users, setUsers] = useState<Record<string, UserProfile>>({});
   const [phoneNumbers, setPhoneNumbers] = useState<PhoneNumber[]>([]);
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
@@ -50,6 +50,40 @@ export default function ConversationsPage() {
   const loadConversations = useCallback(async () => {
     if (!companyId) return;
 
+    let responseConversationIds: string[] | null = null;
+    if (filter === 'seller_responses' || filter === 'buyer_responses') {
+      const audienceType = filter === 'seller_responses' ? 'seller' : 'buyer';
+      const { data: campaigns } = await supabase.from('lead_campaigns')
+        .select('id')
+        .eq('company_id', companyId)
+        .eq('audience_type', audienceType);
+      const campaignIds = (campaigns ?? []).map((campaign) => campaign.id);
+      if (campaignIds.length === 0) {
+        responseConversationIds = [];
+      } else {
+        const { data: leads } = await supabase.from('lead_records')
+          .select('id')
+          .eq('company_id', companyId)
+          .in('campaign_id', campaignIds);
+        const leadIds = (leads ?? []).map((lead) => lead.id);
+        if (leadIds.length === 0) {
+          responseConversationIds = [];
+        } else {
+          const conversationIds = new Set<string>();
+          for (let index = 0; index < leadIds.length; index += 100) {
+            const { data: replies } = await supabase.from('messages')
+              .select('conversation_id')
+              .eq('company_id', companyId)
+              .eq('direction', 'inbound')
+              .in('lead_record_id', leadIds.slice(index, index + 100))
+              .limit(1000);
+            (replies ?? []).forEach((reply) => conversationIds.add(reply.conversation_id));
+          }
+          responseConversationIds = Array.from(conversationIds);
+        }
+      }
+    }
+
     let query = supabase
       .from('conversations')
       .select('*')
@@ -67,17 +101,21 @@ export default function ConversationsPage() {
     else if (filter === 'calls') query = query.not('last_call_at', 'is', null);
     else if (filter === 'email') query = query.eq('channel', 'email');
     else if (filter === 'opted_out') query = query.eq('is_opted_out', true);
+    else if (responseConversationIds) {
+      query = responseConversationIds.length > 0
+        ? query.in('id', responseConversationIds)
+        : query.eq('id', '00000000-0000-0000-0000-000000000000');
+    }
 
     const { data: convs } = await query;
     const convList = (convs ?? []) as Conversation[];
 
     // Resolve contacts
     const contactIds = Array.from(new Set(convList.map((c) => c.contact_id).filter(Boolean)));
-    let cMap: Record<string, Contact> = { ...contacts };
+    const cMap: Record<string, Contact> = {};
     if (contactIds.length > 0) {
       const { data: cData } = await supabase.from('contacts').select('*').in('id', contactIds);
       (cData ?? []).forEach((c) => { cMap[c.id] = c as Contact; });
-      setContacts(cMap);
     }
 
     // Apply search filter
@@ -134,6 +172,8 @@ export default function ConversationsPage() {
   }, []);
 
   const selectConversation = useCallback(async (conv: ConversationWithContact) => {
+    const request = ++opportunityRequest.current;
+    setOpportunity(null);
     setSelectedId(conv.id);
     setSelectedConversation(conv);
     loadTimeline(conv.id);
@@ -146,13 +186,14 @@ export default function ConversationsPage() {
 
     // Load opportunity if linked
     if (conv.opportunity_id) {
-      const { data } = await supabase.from('opportunities').select('*').eq('id', conv.opportunity_id).maybeSingle();
-      setOpportunity(data as Opportunity ?? null);
+      const { data } = await supabase.from('opportunities').select('*').eq('company_id', conv.company_id).eq('id', conv.opportunity_id).is('deleted_at', null).maybeSingle();
+      if (request === opportunityRequest.current) setOpportunity(data as Opportunity ?? null);
     } else if (conv.contact_id) {
-      const { data } = await supabase.from('opportunities').select('*').eq('primary_seller_contact_id', conv.contact_id).order('created_at', { ascending: false }).limit(1).maybeSingle();
-      setOpportunity(data as Opportunity ?? null);
+      // A contact may own multiple properties. Never guess which deal is being discussed.
+      const { data } = await supabase.from('opportunities').select('*').eq('company_id', conv.company_id).eq('primary_seller_contact_id', conv.contact_id).is('deleted_at', null).limit(2);
+      if (request === opportunityRequest.current) setOpportunity(data?.length === 1 ? data[0] as Opportunity : null);
     } else {
-      setOpportunity(null);
+      if (request === opportunityRequest.current) setOpportunity(null);
     }
   }, [loadTimeline]);
 

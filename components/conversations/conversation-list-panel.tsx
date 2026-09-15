@@ -16,6 +16,8 @@ const FILTERS = [
   { key: 'unassigned', label: 'Unassigned' },
   { key: 'sellers', label: 'Sellers' },
   { key: 'buyers', label: 'Buyers' },
+  { key: 'seller_responses', label: 'Seller Replies' },
+  { key: 'buyer_responses', label: 'Buyer Replies' },
   { key: 'sms', label: 'SMS' },
   { key: 'calls', label: 'Calls' },
   { key: 'email', label: 'Email' },

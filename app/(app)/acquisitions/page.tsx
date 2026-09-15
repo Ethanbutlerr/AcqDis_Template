@@ -1,10 +1,12 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/lib/supabase/client';
+import { triggerAutomation } from '@/lib/utils/automation';
+import { createPipelineOpportunity, movePipelineStage } from '@/lib/utils/pipeline-stage';
 import { useAuth } from '@/lib/auth/auth-context';
 import { usePermissions } from '@/lib/auth/use-permissions';
-import { formatCurrency, formatDate, formatRelativeTime } from '@/lib/utils/format';
+import { formatCurrency, formatDate, formatRelativeTime, fullAddress } from '@/lib/utils/format';
 import {
   AcquisitionPipelineStage, AcquisitionRecord, Contact, Property,
   Opportunity, Task, AcquisitionStageHistory,
@@ -20,12 +22,15 @@ import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { AcquisitionDrawer } from '@/components/acquisition-drawer';
+import { StageMoveDialog } from '@/components/stage-move-dialog';
+import { DuplicateReviewDialog } from '@/components/duplicate-review-dialog';
 import { ImportTextWizard, ActiveCampaignIndicator } from '@/components/import-text-wizard';
 import {
   Search, Plus, User, MapPin, Clock, AlertCircle, ChevronUp, ChevronDown,
-  Filter, MoreHorizontal, Save, Star, Phone, PhoneCall, X, TrendingUp, Upload,
+  Filter, Save, Star, Phone, X, TrendingUp, Upload, MessageSquareMore,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import Link from 'next/link';
 
 type SortField = 'seller_name' | 'property_address' | 'priority' | 'stage_entered_at' | 'last_contacted_at' | 'potential_revenue';
 type SortDir = 'asc' | 'desc';
@@ -43,7 +48,7 @@ export default function AcquisitionsPage() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
   const canEdit = hasPermission('edit_acquisitions') || hasPermission('edit_acquisition_records');
-  const canSimulateCall = hasPermission('simulate_answered_call');
+  const canViewAllLeads = !!profile?.is_agency_admin || hasPermission('view_all_acquisition_leads');
   const companyId = profile?.company_id ?? null;
 
   const [stages, setStages] = useState<AcquisitionPipelineStage[]>([]);
@@ -54,6 +59,7 @@ export default function AcquisitionsPage() {
   const [tasksMap, setTasksMap] = useState<Record<string, Task>>({});
   const [users, setUsers] = useState<{ id: string; full_name: string }[]>([]);
   const [loading, setLoading] = useState(true);
+  const [moveError, setMoveError] = useState('');
   const [search, setSearch] = useState('');
   const [sortField, setSortField] = useState<SortField>('stage_entered_at');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
@@ -64,35 +70,63 @@ export default function AcquisitionsPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [showImportText, setShowImportText] = useState(false);
   const [drawerRecordId, setDrawerRecordId] = useState<string | null>(null);
-  const [confirmBackward, setConfirmBackward] = useState<{ recordId: string; fromStage: string; toStage: string } | null>(null);
+  const [pendingStageMove, setPendingStageMove] = useState<{
+    recordId: string;
+    toStageId: string;
+    fromStage: string;
+    toStage: string;
+    requiresConfirmation: boolean;
+    requestId: string;
+  } | null>(null);
+  const [stageMoveSaving, setStageMoveSaving] = useState(false);
   const [savedViews, setSavedViews] = useState<{ id: string; name: string; filters: Record<string, unknown> }[]>([]);
   const [activeViewId, setActiveViewId] = useState<string | null>(null);
   const [showSaveView, setShowSaveView] = useState(false);
   const [viewName, setViewName] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [pendingDuplicateCount, setPendingDuplicateCount] = useState(0);
+  const [showDuplicateReview, setShowDuplicateReview] = useState(false);
+  const loadController = useRef<AbortController | null>(null);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!companyId) return;
+    loadController.current?.abort();
+    const controller = new AbortController();
+    loadController.current = controller;
+    const { signal } = controller;
+    setLoadError('');
     if (showSpinner) setLoading(true);
-
+    try {
     const [stagesRes, usersRes] = await Promise.all([
-      supabase.from('acquisition_pipeline_stages').select('*').eq('company_id', companyId).order('sort_order'),
-      supabase.from('profiles').select('id, full_name').eq('company_id', companyId),
+      supabase.from('acquisition_pipeline_stages').select('*').eq('company_id', companyId).order('sort_order').abortSignal(signal),
+      supabase.from('profiles').select('id, full_name').eq('company_id', companyId).abortSignal(signal),
     ]);
-
-    setStages((stagesRes.data ?? []) as AcquisitionPipelineStage[]);
-    setUsers((usersRes.data ?? []) as { id: string; full_name: string }[]);
+    if (signal.aborted) return;
+    if (stagesRes.error) throw stagesRes.error;
+    if (usersRes.error) throw usersRes.error;
 
     // Paginate through all records
     let allRecords: AcquisitionRecord[] = [];
     let offset = 0;
     let hasMore = true;
     while (hasMore) {
-      const { data } = await supabase
+      let recordsQuery = supabase
         .from('acquisition_records')
         .select('*')
         .eq('company_id', companyId)
         .is('archived_at', null)
+        .order('id')
         .range(offset, offset + FETCH_PAGE_SIZE - 1);
+      if (!canViewAllLeads && profile?.id) {
+        const newLeadStageId = (stagesRes.data ?? []).find((stage) => stage.stage_key === 'new_lead')?.id;
+        const visibilityFilter = newLeadStageId
+          ? `assigned_user_id.eq.${profile.id},and(assigned_user_id.is.null,pipeline_stage_id.eq.${newLeadStageId})`
+          : `assigned_user_id.eq.${profile.id}`;
+        recordsQuery = recordsQuery.or(visibilityFilter);
+      }
+      const { data, error } = await recordsQuery.abortSignal(signal);
+      if (signal.aborted) return;
+      if (error) throw error;
       const batch = (data ?? []) as AcquisitionRecord[];
       allRecords = allRecords.concat(batch);
       hasMore = batch.length === FETCH_PAGE_SIZE;
@@ -110,7 +144,9 @@ export default function AcquisitionsPage() {
       const results: Record<string, unknown>[] = [];
       for (let i = 0; i < ids.length; i += BATCH_SIZE) {
         const chunk = ids.slice(i, i + BATCH_SIZE);
-        const { data } = await supabase.from(table).select('*').in('id', chunk);
+        if (signal.aborted) return results;
+        const { data, error } = await supabase.from(table).select('*').eq('company_id', companyId).in('id', chunk).abortSignal(signal);
+        if (error) throw error;
         if (data) results.push(...data);
       }
       return results;
@@ -124,27 +160,27 @@ export default function AcquisitionsPage() {
 
     const cMap: Record<string, Contact> = {};
     contactsArr.forEach((c) => { const ct = c as unknown as Contact; cMap[ct.id] = ct; });
-    setContactsMap(cMap);
 
     const pMap: Record<string, Property> = {};
     propertiesArr.forEach((p) => { const pt = p as unknown as Property; pMap[pt.id] = pt; });
-    setPropertiesMap(pMap);
 
     const oMap: Record<string, Opportunity> = {};
     oppsArr.forEach((o) => { const ot = o as unknown as Opportunity; oMap[ot.id] = ot; });
-    setOpportunitiesMap(oMap);
 
     // Load next tasks for records (also batched)
+    const tMap: Record<string, Task> = {};
     if (contactIds.length > 0) {
-      const tMap: Record<string, Task> = {};
       for (let i = 0; i < contactIds.length; i += BATCH_SIZE) {
         const chunk = contactIds.slice(i, i + BATCH_SIZE);
-        const { data: taskData } = await supabase
+        if (signal.aborted) return;
+        const { data: taskData, error: taskError } = await supabase
           .from('tasks')
           .select('*')
+          .eq('company_id', companyId)
           .in('related_contact_id', chunk)
           .in('status', ['open', 'in_progress', 'waiting'])
-          .order('due_date', { ascending: true });
+          .order('due_date', { ascending: true }).abortSignal(signal);
+        if (taskError) throw taskError;
         (taskData ?? []).forEach((t) => {
           const t2 = t as Task;
           if (t2.related_contact_id && !tMap[t2.related_contact_id]) {
@@ -152,23 +188,60 @@ export default function AcquisitionsPage() {
           }
         });
       }
-      setTasksMap(tMap);
     }
 
     // Load saved views
-    const { data: viewsData } = await supabase
+    const { data: viewsData, error: viewsError } = await supabase
       .from('saved_views')
       .select('*')
       .eq('company_id', companyId)
-      .eq('view_type', 'acquisitions')
-      .order('name');
-    setSavedViews((viewsData ?? []) as { id: string; name: string; filters: Record<string, unknown> }[]);
+      .eq('page', 'acquisitions')
+      .order('name').abortSignal(signal);
+    if (signal.aborted) return;
+    if (viewsError) throw viewsError;
+    if (canViewAllLeads) {
+      const { count } = await supabase.from('opportunity_duplicate_reviews')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', companyId)
+        .eq('status', 'pending')
+        .abortSignal(signal);
+      if (!signal.aborted) setPendingDuplicateCount(count ?? 0);
+    } else {
+      setPendingDuplicateCount(0);
+    }
+    setStages((stagesRes.data ?? []) as AcquisitionPipelineStage[]);
+    setUsers((usersRes.data ?? []) as { id: string; full_name: string }[]);
+    setContactsMap(cMap);
+    setPropertiesMap(pMap);
+    setOpportunitiesMap(oMap);
+    setTasksMap(tMap);
+    setSavedViews((viewsData ?? []).map((view) => ({
+      id: view.id,
+      name: view.name,
+      filters: (view.config ?? {}) as Record<string, unknown>,
+    })));
 
     setRecords(allRecords);
-    setLoading(false);
-  }, [companyId]);
+    } catch {
+      if (!signal.aborted) setLoadError('The lead list could not be refreshed. Displayed information may be out of date. Please retry.');
+    } finally {
+      if (!signal.aborted) setLoading(false);
+    }
+  }, [canViewAllLeads, companyId, profile?.id]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    setRecords([]);
+    setContactsMap({});
+    setPropertiesMap({});
+    setOpportunitiesMap({});
+    setTasksMap({});
+    setStages([]);
+    setUsers([]);
+    setSavedViews([]);
+    setDrawerRecordId(null);
+    void load();
+    return () => loadController.current?.abort();
+  }, [load]);
 
   const filteredRecords = records.filter((r) => {
     if (filterStage !== 'all' && r.pipeline_stage_id !== filterStage) return false;
@@ -246,136 +319,68 @@ export default function AcquisitionsPage() {
     const toStage = stages.find((s) => s.id === toStageId);
     if (!toStage) return;
 
-    // Check if moving backward from a stage that requires confirmation
-    if (fromStage && toStage.sort_order < fromStage.sort_order && fromStage.requires_confirmation_backward) {
-      setConfirmBackward({ recordId, fromStage: fromStage.name, toStage: toStage.name });
-      return;
-    }
-
-    await changeStage(recordId, toStageId, false, 'drag_and_drop');
+    setPendingStageMove({
+      recordId,
+      toStageId,
+      fromStage: fromStage?.name ?? 'Unknown stage',
+      toStage: toStage.name,
+      requiresConfirmation: !!fromStage && toStage.sort_order < fromStage.sort_order && fromStage.requires_confirmation_backward,
+      requestId: crypto.randomUUID(),
+    });
   };
 
-  const changeStage = async (recordId: string, toStageId: string, isAutomated: boolean, reason: string) => {
-    if (!companyId) return;
+  const changeStage = async (recordId: string, toStageId: string, note: string, requestId: string) => {
+    if (!companyId) return false;
     const record = records.find((r) => r.id === recordId);
-    if (!record) return;
+    if (!record || !record.pipeline_stage_id || !canEdit) return false;
 
     const fromStageId = record.pipeline_stage_id;
-
-    // Check if moving to a stage that should auto-assign to the acting user
-    const targetStage = stages.find((s) => s.id === toStageId);
-    const autoAssignStages = ['dead', 'dead/dnc', 'no answer', 'answered'];
-    const shouldAutoAssign = targetStage && autoAssignStages.includes(targetStage.name.toLowerCase()) && profile?.id;
-
-    const updatePayload: Record<string, unknown> = {
-      pipeline_stage_id: toStageId,
-      stage_entered_at: new Date().toISOString(),
-    };
-    if (shouldAutoAssign) {
-      updatePayload.assigned_user_id = profile!.id;
+    setMoveError('');
+    let savedRecord: AcquisitionRecord;
+    try {
+      savedRecord = await movePipelineStage<AcquisitionRecord>({
+        pipeline: 'acquisition',
+        recordId,
+        expectedStageId: fromStageId,
+        toStageId,
+        note,
+        requestId,
+      });
+    } catch (error) {
+      setMoveError(error instanceof Error ? error.message : 'Unable to move lead.');
+      await load(false);
+      return false;
     }
-
-    await supabase.from('acquisition_records').update(updatePayload).eq('id', recordId);
-
-    await supabase.from('acquisition_stage_history').insert({
-      company_id: companyId,
-      acquisition_record_id: recordId,
-      from_stage_id: fromStageId,
-      to_stage_id: toStageId,
-      changed_by: profile?.id ?? null,
-      is_automated: isAutomated,
-      reason,
-    });
-
-    await supabase.from('activity_events').insert({
-      company_id: companyId,
-      actor_id: profile?.id ?? null,
-      entity_type: 'acquisition_record',
-      entity_id: recordId,
-      event_type: 'acquisition_stage_changed',
-      metadata: { from_stage_id: fromStageId, to_stage_id: toStageId, reason, is_automated: isAutomated },
-    });
 
     // Trigger automations via edge function
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/functions/v1/automation-engine`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''}` },
-        body: JSON.stringify({
-          action: 'trigger',
-          trigger_type: 'stage_changed',
-          company_id: companyId,
-          record_id: recordId,
-          record_type: 'acquisition_record',
-          metadata: { from_stage_id: fromStageId, to_stage_id: toStageId, changed_by: profile?.id },
-        }),
-      });
-    } catch { /* non-blocking */ }
-
-    setRecords((prev) => prev.map((r) => r.id === recordId ? { ...r, pipeline_stage_id: toStageId, stage_entered_at: new Date().toISOString(), ...(shouldAutoAssign ? { assigned_user_id: profile!.id } : {}) } : r));
-  };
-
-  const confirmBackwardMove = async () => {
-    if (!confirmBackward) return;
-    await changeStage(confirmBackward.recordId, stages.find((s) => s.name === confirmBackward.toStage)?.id ?? '', false, 'manual_backward_with_confirmation');
-    setConfirmBackward(null);
-  };
-
-  const simulateAnsweredCall = async (recordId: string) => {
-    if (!companyId || !profile?.id) return;
-    const record = records.find((r) => r.id === recordId);
-    if (!record) return;
-
-    // Assign to current user if unassigned or if user has reassignment permission
-    if (!record.assigned_user_id || hasPermission('edit_acquisitions')) {
-      const prevAssignee = record.assigned_user_id;
-      await supabase.from('acquisition_records').update({
-        assigned_user_id: profile.id,
-        last_contacted_at: new Date().toISOString(),
-      }).eq('id', recordId);
-
-      await supabase.from('acquisition_assignment_history').insert({
+      await triggerAutomation({
+        trigger_type: 'stage_changed',
         company_id: companyId,
-        acquisition_record_id: recordId,
-        from_user_id: prevAssignee,
-        to_user_id: profile.id,
-        changed_by: profile.id,
-        reason: 'Answered Call',
+        record_id: recordId,
+        record_type: 'acquisition_record',
+        metadata: { request_id: requestId, from_stage_id: fromStageId, to_stage_id: toStageId, changed_by: profile?.id, note },
       });
-
-      await supabase.from('activity_events').insert({
-        company_id: companyId,
-        actor_id: profile.id,
-        entity_type: 'acquisition_record',
-        entity_id: recordId,
-        event_type: 'acquisition_call_answered',
-        metadata: { assigned_to: profile.id, simulated: true },
-      });
+    } catch (error) {
+      setMoveError((current) => current || (error instanceof Error ? error.message : 'Lead moved, but its follow-up automation could not be started.'));
     }
 
-    // Move to Answered stage if configured
-    const answeredStage = stages.find((s) => s.name === 'Answered');
-    if (answeredStage && record.pipeline_stage_id !== answeredStage.id) {
-      await changeStage(recordId, answeredStage.id, true, 'answered_call_simulation');
-    }
+    setRecords((prev) => prev.map((r) => r.id === recordId ? savedRecord : r));
+    return true;
+  };
 
-    // Trigger automations
-    try {
-      await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/functions/v1/automation-engine`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''}` },
-        body: JSON.stringify({
-          action: 'trigger',
-          trigger_type: 'call_answered',
-          company_id: companyId,
-          record_id: recordId,
-          record_type: 'acquisition_record',
-          metadata: { user_id: profile.id, simulated: true },
-        }),
-      });
-    } catch { /* non-blocking */ }
-
-    setRecords((prev) => prev.map((r) => r.id === recordId ? { ...r, assigned_user_id: profile!.id, last_contacted_at: new Date().toISOString() } : r));
+  const confirmStageMove = async (note: string) => {
+    if (!pendingStageMove) return false;
+    setStageMoveSaving(true);
+    const completed = await changeStage(
+      pendingStageMove.recordId,
+      pendingStageMove.toStageId,
+      note,
+      pendingStageMove.requestId,
+    );
+    setStageMoveSaving(false);
+    if (completed) setPendingStageMove(null);
+    return completed;
   };
 
   const saveView = async () => {
@@ -384,11 +389,15 @@ export default function AcquisitionsPage() {
     const { data } = await supabase.from('saved_views').insert({
       company_id: companyId,
       name: viewName,
-      view_type: 'acquisitions',
-      filters,
+      page: 'acquisitions',
+      config: filters,
     }).select().single();
     if (data) {
-      setSavedViews([...savedViews, data as { id: string; name: string; filters: Record<string, unknown> }]);
+      setSavedViews([...savedViews, {
+        id: data.id,
+        name: data.name,
+        filters: (data.config ?? {}) as Record<string, unknown>,
+      }]);
       setActiveViewId(data.id);
     }
     setViewName('');
@@ -425,6 +434,11 @@ export default function AcquisitionsPage() {
 
   return (
     <div className="flex flex-col h-full animate-in">
+      {loadError && <div role="alert" className="px-6 pt-3 flex items-center gap-3 text-sm text-destructive">
+        <span>{loadError}</span>
+        <Button variant="outline" size="sm" onClick={() => load()}>Retry</Button>
+      </div>}
+      {moveError && <p role="alert" className="px-6 pt-3 text-sm text-destructive">{moveError}</p>}
       {/* Active campaign indicator */}
       {companyId && <div className="px-6 pt-3"><ActiveCampaignIndicator companyId={companyId} /></div>}
 
@@ -451,9 +465,20 @@ export default function AcquisitionsPage() {
               <Upload className="h-4 w-4" /> Import
             </Button>
           )}
+          {canViewAllLeads && pendingDuplicateCount > 0 && (
+            <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setShowDuplicateReview(true)}>
+              <AlertCircle className="h-4 w-4 text-amber-600" /> Review Repeats
+              <Badge variant="secondary" className="ml-1">{pendingDuplicateCount}</Badge>
+            </Button>
+          )}
           {canEdit && (
             <Button size="sm" className="gap-1.5" onClick={() => setShowCreate(true)}>
-              <Plus className="h-4 w-4" /> New Acquisition
+              <Plus className="h-4 w-4" /> New Opportunity
+            </Button>
+          )}
+          {hasPermission('create_lead_campaigns') && (
+            <Button asChild variant="outline" size="sm" className="gap-1.5">
+              <Link href="/sms-blasts?audience=seller"><MessageSquareMore className="h-4 w-4" /> SMS Blast Sellers</Link>
             </Button>
           )}
         </div>
@@ -567,24 +592,10 @@ export default function AcquisitionsPage() {
                               </p>
                               {property && (
                                 <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1 truncate">
-                                  <MapPin className="h-3 w-3 shrink-0" /> {[property.street_address, property.city, property.state].filter(Boolean).join(', ')}
+                                  <MapPin className="h-3 w-3 shrink-0" /> {fullAddress(property) || 'No address'}
                                 </p>
                               )}
                             </div>
-                            <DropdownMenu>
-                              <DropdownMenuTrigger asChild>
-                                <button onClick={(e) => e.stopPropagation()} className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-accent">
-                                  <MoreHorizontal className="h-3.5 w-3.5 text-muted-foreground" />
-                                </button>
-                              </DropdownMenuTrigger>
-                              <DropdownMenuContent align="end">
-                                {canSimulateCall && (
-                                  <DropdownMenuItem onClick={(e) => { e.stopPropagation(); simulateAnsweredCall(record.id); }}>
-                                    <PhoneCall className="mr-2 h-3.5 w-3.5" /> Simulate Answered Call
-                                  </DropdownMenuItem>
-                                )}
-                              </DropdownMenuContent>
-                            </DropdownMenu>
                           </div>
 
                           <div className="flex items-center gap-1.5 mt-2 flex-wrap">
@@ -645,8 +656,8 @@ export default function AcquisitionsPage() {
       {showCreate && companyId && (
         <CreateAcquisitionDialog
           companyId={companyId}
-          userId={profile?.id ?? null}
           stages={stages}
+          canCreateDisposition={hasPermission('edit_dispositions')}
           onClose={() => setShowCreate(false)}
           onCreated={() => { setShowCreate(false); load(); }}
         />
@@ -668,32 +679,33 @@ export default function AcquisitionsPage() {
           companyId={companyId}
           userId={profile?.id ?? null}
           canEdit={canEdit}
-          canSimulateCall={canSimulateCall}
           stages={stages}
           onClose={() => setDrawerRecordId(null)}
           onUpdated={() => load(false)}
         />
       )}
 
-      {/* Backward confirmation */}
-      {confirmBackward && (
-        <Dialog open onOpenChange={() => setConfirmBackward(null)}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2">
-                <AlertCircle className="h-5 w-5 text-amber-600" /> Confirm Stage Move
-              </DialogTitle>
-            </DialogHeader>
-            <p className="text-sm text-muted-foreground py-2">
-              You are moving this record from <strong>{confirmBackward.fromStage}</strong> back to <strong>{confirmBackward.toStage}</strong>.
-              This stage normally requires confirmation before moving backward. Do you want to proceed?
-            </p>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setConfirmBackward(null)}>Cancel</Button>
-              <Button onClick={confirmBackwardMove}>Confirm Move</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+      {pendingStageMove && (
+        <StageMoveDialog
+          open
+          fromStage={pendingStageMove.fromStage}
+          toStage={pendingStageMove.toStage}
+          requiresConfirmation={pendingStageMove.requiresConfirmation}
+          saving={stageMoveSaving}
+          error={moveError}
+          onCancel={() => setPendingStageMove(null)}
+          onConfirm={confirmStageMove}
+        />
+      )}
+
+      {showDuplicateReview && companyId && (
+        <DuplicateReviewDialog
+          open
+          companyId={companyId}
+          userId={profile?.id ?? null}
+          onClose={() => setShowDuplicateReview(false)}
+          onChanged={() => setPendingDuplicateCount((count) => Math.max(0, count - 1))}
+        />
       )}
 
       {/* Save view dialog */}
@@ -717,16 +729,22 @@ export default function AcquisitionsPage() {
 }
 
 function CreateAcquisitionDialog({
-  companyId, userId, stages, onClose, onCreated,
+  companyId, stages, canCreateDisposition, onClose, onCreated,
 }: {
   companyId: string;
-  userId: string | null;
   stages: AcquisitionPipelineStage[];
+  canCreateDisposition: boolean;
   onClose: () => void;
   onCreated: () => void;
 }) {
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState<Record<string, boolean>>({});
+  const [saveError, setSaveError] = useState('');
+  const [requestId] = useState(() => crypto.randomUUID());
+  const [pipeline, setPipeline] = useState<'acquisition' | 'disposition'>('acquisition');
+  const [dispositionStages, setDispositionStages] = useState<{ id: string; name: string; stage_key?: string | null }[]>([]);
+  const targetStages = pipeline === 'acquisition' ? stages : dispositionStages;
+  const [stageId, setStageId] = useState('');
 
   const [createdDate, setCreatedDate] = useState(new Date().toISOString().slice(0, 10));
   const [sourceChannel, setSourceChannel] = useState('');
@@ -747,12 +765,25 @@ function CreateAcquisitionDialog({
   const [recentlyPurchased, setRecentlyPurchased] = useState('');
   const [leadId, setLeadId] = useState('');
 
-  const REQUIRED_FIELDS = [
-    'createdDate', 'sourceChannel', 'firstName', 'lastName', 'phone', 'email',
-    'timeline', 'condition', 'occupancy', 'askingPrice', 'opinionOfValue',
-    'propertyAddress', 'motivation', 'propertyListed', 'agentInvolved',
-    'propertyType', 'recentlyPurchased',
-  ];
+  useEffect(() => {
+    if (!canCreateDisposition) return;
+    void supabase.from('disposition_pipeline_stages')
+      .select('id,name,stage_key')
+      .eq('company_id', companyId)
+      .order('position')
+      .then(({ data, error }) => {
+        if (error) setSaveError(`Disposition stages could not be loaded: ${error.message}`);
+        else setDispositionStages(data ?? []);
+      });
+  }, [canCreateDisposition, companyId]);
+
+  useEffect(() => {
+    if (!targetStages.some((stage) => stage.id === stageId)) {
+      setStageId(targetStages.find((stage) => stage.stage_key === 'new_lead')?.id ?? targetStages[0]?.id ?? '');
+    }
+  }, [stageId, targetStages]);
+
+  const REQUIRED_FIELDS: string[] = [];
 
   const fieldValues: Record<string, string> = {
     createdDate, sourceChannel, firstName, lastName, phone, email,
@@ -771,86 +802,52 @@ function CreateAcquisitionDialog({
   const create = async () => {
     if (!validate()) return;
     setSaving(true);
-
-    const { data: contact } = await supabase.from('contacts').insert({
-      company_id: companyId,
-      first_name: firstName.trim(),
-      last_name: lastName.trim(),
-      primary_phone: phone.trim(),
-      primary_email: email.trim(),
-      contact_type: 'seller',
-      lead_generated_at: new Date(createdDate).toISOString(),
-    }).select().single();
-
-    if (!contact) { setSaving(false); return; }
-
-    const { data: property } = await supabase.from('properties').insert({
-      company_id: companyId,
-      street_address: propertyAddress.trim(),
-      property_type: propertyType.trim().toLowerCase(),
-      property_condition: condition.trim(),
-      occupancy_status: occupancy.trim(),
-      asking_price: parseFloat(askingPrice.replace(/[^0-9.]/g, '')) || 0,
-      estimated_value: parseFloat(opinionOfValue.replace(/[^0-9.]/g, '')) || 0,
-      is_listed: propertyListed.toLowerCase() === 'yes',
-      has_agent: agentInvolved.toLowerCase() === 'yes',
-    }).select().single();
-
-    if (!property) { setSaving(false); return; }
-
-    const newLeadStage = stages.find((s) => s.name === 'New Lead') ?? stages[0];
-
-    const { data: record } = await supabase.from('acquisition_records').insert({
-      company_id: companyId,
-      contact_id: contact.id,
-      property_id: property.id,
-      pipeline_stage_id: newLeadStage?.id ?? null,
-      lead_source: sourceChannel.trim(),
-      motivation: motivation.trim() || null,
-      priority: 'medium',
-      assigned_user_id: null,
-      stage_entered_at: new Date(createdDate).toISOString(),
-      metadata: {
-        timeline: timeline.trim(),
-        recently_purchased: recentlyPurchased.trim(),
-        lead_id: leadId.trim() || undefined,
-      },
-    }).select().single();
-
-    if (record) {
-      await supabase.from('acquisition_stage_history').insert({
-        company_id: companyId,
-        acquisition_record_id: record.id,
-        from_stage_id: null,
-        to_stage_id: newLeadStage?.id ?? null,
-        changed_by: userId,
-        is_automated: false,
-        reason: 'record_created',
+    setSaveError('');
+    if (!stageId) {
+      setSaveError(`The selected ${pipeline} pipeline has no configured stages.`);
+      setSaving(false);
+      return;
+    }
+    try {
+      const result = await createPipelineOpportunity<AcquisitionRecord>({
+        pipeline,
+        stageId,
+        contact: { first_name: firstName, last_name: lastName, phone, email },
+        property: {
+          street_address: propertyAddress,
+          property_type: propertyType,
+          property_condition: condition,
+          occupancy_status: occupancy,
+          asking_price: askingPrice ? Number(askingPrice.replace(/[^0-9.]/g, '')) : null,
+          estimated_value: opinionOfValue ? Number(opinionOfValue.replace(/[^0-9.]/g, '')) : null,
+          is_listed: propertyListed === 'yes' ? true : propertyListed === 'no' ? false : null,
+          has_agent: agentInvolved === 'yes' ? true : agentInvolved === 'no' ? false : null,
+        },
+        details: {
+          created_at: createdDate ? new Date(`${createdDate}T12:00:00`).toISOString() : undefined,
+          lead_source: sourceChannel,
+          motivation,
+          priority: 'medium',
+          metadata: { timeline, recently_purchased: recentlyPurchased, lead_id: leadId || undefined },
+        },
+        requestId,
       });
 
-      await supabase.from('activity_events').insert({
-        company_id: companyId,
-        actor_id: userId,
-        entity_type: 'acquisition_record',
-        entity_id: record.id,
-        event_type: 'acquisition_record_created',
-        metadata: { source_channel: sourceChannel },
-      });
-
-      try {
-        await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/functions/v1/automation-engine`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''}` },
-          body: JSON.stringify({
-            action: 'trigger',
+      if (pipeline === 'acquisition') {
+        try {
+          await triggerAutomation({
             trigger_type: 'lead_created',
             company_id: companyId,
-            record_id: record.id,
+            record_id: result.record.id,
             record_type: 'acquisition_record',
-            metadata: { source_channel: sourceChannel },
-          }),
-        });
-      } catch { /* non-blocking */ }
+            metadata: { source_channel: sourceChannel, request_id: requestId },
+          });
+        } catch { /* Creation is complete; follow-up automation can be retried. */ }
+      }
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Unable to create opportunity.');
+      setSaving(false);
+      return;
     }
 
     setSaving(false);
@@ -862,15 +859,37 @@ function CreateAcquisitionDialog({
   return (
     <Dialog open onOpenChange={onClose}>
       <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
-        <DialogHeader><DialogTitle>New Acquisition Record</DialogTitle></DialogHeader>
+        <DialogHeader><DialogTitle>New Opportunity</DialogTitle></DialogHeader>
         <div className="space-y-4 py-2">
+          {saveError && <p className="text-sm text-destructive">{saveError}</p>}
+          <div className="grid grid-cols-2 gap-4 rounded-lg border bg-muted/20 p-3">
+            <div className="space-y-1.5">
+              <Label>Pipeline</Label>
+              <Select value={pipeline} onValueChange={(value) => setPipeline(value as 'acquisition' | 'disposition')} disabled={!canCreateDisposition}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="acquisition">Acquisitions</SelectItem>
+                  {canCreateDisposition && <SelectItem value="disposition">Dispositions</SelectItem>}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Stage</Label>
+              <Select value={stageId} onValueChange={setStageId}>
+                <SelectTrigger><SelectValue placeholder="Select stage..." /></SelectTrigger>
+                <SelectContent>
+                  {targetStages.map((stage) => <SelectItem key={stage.id} value={stage.id}>{stage.name}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <Label>Lead Generated Date *</Label>
+              <Label>Lead Generated Date</Label>
               <Input type="date" value={createdDate} onChange={(e) => setCreatedDate(e.target.value)} className={fieldClass('createdDate')} />
             </div>
             <div className="space-y-1.5">
-              <Label>Source Channel *</Label>
+              <Label>Source Channel</Label>
               <Select value={sourceChannel} onValueChange={setSourceChannel}>
                 <SelectTrigger className={fieldClass('sourceChannel')}><SelectValue placeholder="Select source..." /></SelectTrigger>
                 <SelectContent>
@@ -887,67 +906,66 @@ function CreateAcquisitionDialog({
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <Label>First Name *</Label>
+              <Label>First Name</Label>
               <Input value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder="First name" className={fieldClass('firstName')} />
             </div>
             <div className="space-y-1.5">
-              <Label>Last Name *</Label>
+              <Label>Last Name</Label>
               <Input value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder="Last name" className={fieldClass('lastName')} />
             </div>
           </div>
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <Label>Phone *</Label>
+              <Label>Phone</Label>
               <Input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="(555) 123-4567" className={fieldClass('phone')} />
             </div>
             <div className="space-y-1.5">
-              <Label>Email *</Label>
+              <Label>Email</Label>
               <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="email@example.com" className={fieldClass('email')} />
             </div>
           </div>
 
           <div className="space-y-1.5">
-            <Label>Property Address *</Label>
+            <Label>Full Property Address</Label>
             <Input value={propertyAddress} onChange={(e) => setPropertyAddress(e.target.value)} placeholder="123 Main St, City, State 12345" className={fieldClass('propertyAddress')} />
           </div>
 
           <div className="grid grid-cols-3 gap-4">
             <div className="space-y-1.5">
-              <Label>Timeline *</Label>
+              <Label>How soon are you looking to sell?</Label>
               <Select value={timeline} onValueChange={setTimeline}>
                 <SelectTrigger className={fieldClass('timeline')}><SelectValue placeholder="Select..." /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="immediate">Immediate</SelectItem>
-                  <SelectItem value="1-2 weeks">1-2 Weeks</SelectItem>
-                  <SelectItem value="30 days">30 Days</SelectItem>
-                  <SelectItem value="60 days">60 Days</SelectItem>
-                  <SelectItem value="90+ days">90+ Days</SelectItem>
-                  <SelectItem value="not sure">Not Sure</SelectItem>
+                  <SelectItem value="as_soon_as_possible">As soon as possible</SelectItem>
+                  <SelectItem value="within_30_days">Within 30 days</SelectItem>
+                  <SelectItem value="within_60_days">Within 60 days</SelectItem>
+                  <SelectItem value="within_90_days">Within 90 days</SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label>Condition *</Label>
+              <Label>Property Condition</Label>
               <Select value={condition} onValueChange={setCondition}>
                 <SelectTrigger className={fieldClass('condition')}><SelectValue placeholder="Select..." /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="excellent">Excellent</SelectItem>
-                  <SelectItem value="good">Good</SelectItem>
-                  <SelectItem value="fair">Fair</SelectItem>
-                  <SelectItem value="poor">Poor</SelectItem>
-                  <SelectItem value="needs_rehab">Needs Rehab</SelectItem>
-                  <SelectItem value="tear_down">Tear Down</SelectItem>
+                  <SelectItem value="cleaning_needed">Could use a cleaning</SelectItem>
+                  <SelectItem value="minor_repairs">Needs minor repairs</SelectItem>
+                  <SelectItem value="major_repairs">Needs major expensive repairs</SelectItem>
+                  <SelectItem value="gut_teardown">Gut job / teardown</SelectItem>
+                  <SelectItem value="vacant_land">Vacant land</SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label>Occupancy *</Label>
+              <Label>Is the property occupied?</Label>
               <Select value={occupancy} onValueChange={setOccupancy}>
                 <SelectTrigger className={fieldClass('occupancy')}><SelectValue placeholder="Select..." /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="owner_occupied">Owner Occupied</SelectItem>
                   <SelectItem value="tenant_occupied">Tenant Occupied</SelectItem>
+                  <SelectItem value="squatter_occupied">Squatter Occupied</SelectItem>
                   <SelectItem value="vacant">Vacant</SelectItem>
                 </SelectContent>
               </Select>
@@ -956,23 +974,37 @@ function CreateAcquisitionDialog({
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <Label>Asking Price *</Label>
+              <Label>Asking Price for a 10-Day Closing</Label>
               <Input value={askingPrice} onChange={(e) => setAskingPrice(e.target.value)} placeholder="$150,000" className={fieldClass('askingPrice')} />
             </div>
             <div className="space-y-1.5">
-              <Label>Opinion of Value *</Label>
+              <Label>Seller&apos;s Opinion of Value</Label>
               <Input value={opinionOfValue} onChange={(e) => setOpinionOfValue(e.target.value)} placeholder="$180,000" className={fieldClass('opinionOfValue')} />
             </div>
           </div>
 
           <div className="space-y-1.5">
-            <Label>Motivation *</Label>
-            <Textarea value={motivation} onChange={(e) => setMotivation(e.target.value)} placeholder="Why is the seller looking to sell?" className={fieldClass('motivation')} />
+            <Label>What has you considering selling?</Label>
+            <Select value={motivation} onValueChange={setMotivation}>
+              <SelectTrigger className={fieldClass('motivation')}><SelectValue placeholder="Select..." /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="financial_hardship">Financial hardship</SelectItem>
+                <SelectItem value="inherited_property">Inherited property</SelectItem>
+                <SelectItem value="divorce_separation">Divorce or separation</SelectItem>
+                <SelectItem value="major_repairs_needed">Major repairs needed</SelectItem>
+                <SelectItem value="relocation_job_change">Relocation or job change</SelectItem>
+                <SelectItem value="tired_landlord">Tired landlord</SelectItem>
+                <SelectItem value="health_aging">Health issues or aging</SelectItem>
+                <SelectItem value="foreclosure_risk">Pre-foreclosure / foreclosure risk</SelectItem>
+                <SelectItem value="vacant_unwanted">Vacant or unwanted property</SelectItem>
+                <SelectItem value="life_changes">Life changes</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="grid grid-cols-3 gap-4">
             <div className="space-y-1.5">
-              <Label>Property Listed *</Label>
+              <Label>Listed Online</Label>
               <Select value={propertyListed} onValueChange={setPropertyListed}>
                 <SelectTrigger className={fieldClass('propertyListed')}><SelectValue placeholder="Select..." /></SelectTrigger>
                 <SelectContent>
@@ -982,7 +1014,7 @@ function CreateAcquisitionDialog({
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label>Agent Involved *</Label>
+              <Label>Working with an Agent</Label>
               <Select value={agentInvolved} onValueChange={setAgentInvolved}>
                 <SelectTrigger className={fieldClass('agentInvolved')}><SelectValue placeholder="Select..." /></SelectTrigger>
                 <SelectContent>
@@ -992,13 +1024,12 @@ function CreateAcquisitionDialog({
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label>Recently Purchased *</Label>
+              <Label>Purchased Within Five Years</Label>
               <Select value={recentlyPurchased} onValueChange={setRecentlyPurchased}>
                 <SelectTrigger className={fieldClass('recentlyPurchased')}><SelectValue placeholder="Select..." /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="yes">Yes</SelectItem>
-                  <SelectItem value="no">No</SelectItem>
-                  <SelectItem value="unknown">Unknown</SelectItem>
+                  <SelectItem value="no">No, owned longer than five years</SelectItem>
+                  <SelectItem value="yes">Yes, purchased within five years</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -1006,17 +1037,16 @@ function CreateAcquisitionDialog({
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <Label>Property Type *</Label>
+              <Label>Property Type</Label>
               <Select value={propertyType} onValueChange={setPropertyType}>
                 <SelectTrigger className={fieldClass('propertyType')}><SelectValue placeholder="Select..." /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="single_family">Single Family</SelectItem>
-                  <SelectItem value="multi_family">Multi Family</SelectItem>
-                  <SelectItem value="condo">Condo</SelectItem>
-                  <SelectItem value="townhouse">Townhouse</SelectItem>
-                  <SelectItem value="land">Land</SelectItem>
-                  <SelectItem value="commercial">Commercial</SelectItem>
-                  <SelectItem value="mobile_home">Mobile Home</SelectItem>
+                  <SelectItem value="multi_family_2_4">Multi Family (2–4 units)</SelectItem>
+                  <SelectItem value="commercial_multi_family_5_plus">Commercial Multi Family (5+ units)</SelectItem>
+                  <SelectItem value="mobile_manufactured_home">Mobile / Manufactured Home</SelectItem>
+                  <SelectItem value="condo_townhome">Condo / Townhome</SelectItem>
+                  <SelectItem value="vacant_land">Vacant Land</SelectItem>
                   <SelectItem value="other">Other</SelectItem>
                 </SelectContent>
               </Select>

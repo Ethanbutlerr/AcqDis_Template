@@ -19,12 +19,41 @@ Deno.serve(async (req: Request) => {
 
     const body = await req.json();
     const action = body.action ?? "trigger";
+    const authorization = req.headers.get("Authorization") ?? "";
+    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+    const isServiceRequest = token === serviceKey;
+    let actor: { id: string; company_id: string; is_agency_admin: boolean } | null = null;
+
+    if (!isServiceRequest) {
+      if (!token) return jsonResponse({ error: "Authentication required" }, 401);
+      const { data: userData, error: userError } = await supabase.auth.getUser(token);
+      if (userError || !userData.user) return jsonResponse({ error: "Invalid or expired session" }, 401);
+      const { data: profile, error: profileError } = await supabase
+        .from("profiles")
+        .select("id, company_id, is_agency_admin, is_disabled")
+        .eq("id", userData.user.id)
+        .maybeSingle();
+      if (profileError || !profile || profile.is_disabled) return jsonResponse({ error: "User access is unavailable" }, 403);
+      actor = { id: profile.id, company_id: profile.company_id, is_agency_admin: !!profile.is_agency_admin };
+    }
 
     if (action === "trigger") {
+      if (!body.company_id || (!isServiceRequest && actor?.company_id !== body.company_id)) {
+        return jsonResponse({ error: "Company access denied" }, 403);
+      }
+      if (!isServiceRequest && actor) {
+        const authorizationError = await authorizeTrigger(supabase, actor, body);
+        if (authorizationError) return jsonResponse({ error: authorizationError }, 403);
+        body.metadata = { ...(body.metadata ?? {}), changed_by: actor.id };
+      }
       return await triggerAutomations(supabase, body);
     } else if (action === "process_follow_ups") {
+      if (!isServiceRequest) return jsonResponse({ error: "Service authorization required" }, 403);
       return await processFollowUps(supabase);
     } else if (action === "seed_default_automations") {
+      if (!isServiceRequest && (!actor || actor.company_id !== body.company_id || !(actor.is_agency_admin || await userHasPermission(supabase, actor.id, actor.company_id, "manage_integrations")))) {
+        return jsonResponse({ error: "Manager access required" }, 403);
+      }
       return await seedDefaultAutomations(supabase, body.company_id);
     }
 
@@ -33,6 +62,37 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: err.message }, 500);
   }
 });
+
+async function userHasPermission(supabase: any, userId: string, companyId: string, permissionKey: string): Promise<boolean> {
+  const { data: permission } = await supabase.from("permissions").select("id").eq("key", permissionKey).maybeSingle();
+  if (!permission) return false;
+  const { data: rolePermissions } = await supabase.from("role_permissions").select("role_id").eq("permission_id", permission.id);
+  const roleIds = (rolePermissions ?? []).map((row: { role_id: string }) => row.role_id);
+  if (roleIds.length === 0) return false;
+  const { data: companyRoles } = await supabase.from("roles").select("id").eq("company_id", companyId).in("id", roleIds);
+  const companyRoleIds = (companyRoles ?? []).map((row: { id: string }) => row.id);
+  if (companyRoleIds.length === 0) return false;
+  const { data: membership } = await supabase.from("user_roles").select("id").eq("user_id", userId).in("role_id", companyRoleIds).limit(1).maybeSingle();
+  return !!membership;
+}
+
+async function authorizeTrigger(
+  supabase: any,
+  actor: { id: string; company_id: string; is_agency_admin: boolean },
+  body: Record<string, any>,
+): Promise<string | null> {
+  if (body.record_type !== "acquisition_record") return "Unsupported record type";
+  const { data: record } = await supabase
+    .from("acquisition_records")
+    .select("id, company_id, assigned_user_id")
+    .eq("id", body.record_id)
+    .eq("company_id", actor.company_id)
+    .maybeSingle();
+  if (!record) return "Record not found";
+  if (record.assigned_user_id === actor.id || !record.assigned_user_id) return null;
+  if (actor.is_agency_admin || await userHasPermission(supabase, actor.id, actor.company_id, "view_all_acquisition_leads")) return null;
+  return "This record is assigned to another user";
+}
 
 async function triggerAutomations(supabase: any, params: {
   trigger_type: string;
@@ -55,7 +115,14 @@ async function triggerAutomations(supabase: any, params: {
   let skipped = 0;
 
   for (const automation of automations ?? []) {
-    const idempotencyKey = `${automation.id}-${trigger_type}-${record_id}`;
+    const eventIdentity = metadata?.request_id
+      ?? metadata?.call_sid
+      ?? metadata?.message_id
+      ?? metadata?.event_id
+      ?? (trigger_type === "stage_changed"
+        ? `${metadata?.from_stage_id ?? "unknown"}-${metadata?.to_stage_id ?? "unknown"}`
+        : "once");
+    const idempotencyKey = `${automation.id}-${trigger_type}-${record_id}-${String(eventIdentity)}`;
 
     // Check idempotency — prevent duplicate execution
     const { data: existingRun } = await supabase
@@ -154,6 +221,7 @@ async function handleBuiltInTriggers(supabase: any, trigger_type: string, compan
     .from("acquisition_records")
     .select("*")
     .eq("id", record_id)
+    .eq("company_id", company_id)
     .maybeSingle();
   if (!record) return;
 
@@ -165,13 +233,14 @@ async function handleBuiltInTriggers(supabase: any, trigger_type: string, compan
       .from("acquisition_pipeline_stages")
       .select("name")
       .eq("id", toStageId)
+      .eq("company_id", company_id)
       .maybeSingle();
     if (stage?.name === "Needs Offer") {
       await handleNeedsOfferAutomation(supabase, company_id, record);
     } else if (stage?.name === "Needs Contract") {
       await handleNeedsContractAutomation(supabase, company_id, record);
     } else if (stage?.name === "Contract Executed") {
-      await handleContractExecutedAutomation(supabase, company_id, record);
+      await handleContractExecutedAutomation(supabase, company_id, record, metadata);
     }
   } else if (trigger_type === "call_answered") {
     await handleCallAnsweredAutomation(supabase, company_id, record, metadata);
@@ -197,7 +266,7 @@ async function handleNewLeadAutomation(supabase: any, company_id: string, record
       status: "open",
       priority: "high",
       related_contact_id: record.contact_id,
-      assigned_to: record.assigned_user_id,
+      assigned_user_id: record.assigned_user_id,
       created_by: metadata.changed_by ?? null,
       due_date: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
     });
@@ -401,30 +470,32 @@ async function handleNeedsContractAutomation(supabase: any, company_id: string, 
   }
 }
 
-async function handleContractExecutedAutomation(supabase: any, company_id: string, record: any) {
-  // Idempotency guard — only run once per acquisition record
+async function handleContractExecutedAutomation(supabase: any, company_id: string, record: any, metadata: Record<string, unknown>) {
+  if (!record.opportunity_id) throw new Error("Contract handoff requires a linked opportunity");
+  if (!record.property_id || !record.contact_id) throw new Error("Contract handoff requires a linked contact and property");
+
+  // A completed synchronization event is the final marker, not a reservation.
+  // Each dependent write below is independently retry-safe, so a failed attempt can resume.
   const dispIdemKey = `contract-executed-${record.id}-create-disposition`;
-  const { error: idemErr } = await supabase.from("synchronization_events").insert({
-    company_id,
-    entity_type: "acquisition_record",
-    entity_id: record.id,
-    source_pipeline: "acquisition",
-    target_pipeline: "disposition",
-    idempotency_key: dispIdemKey,
-    result: "success",
-  });
-  const alreadyRan = idemErr && idemErr.code === "23505";
+  const { data: completedSync } = await supabase.from("synchronization_events")
+    .select("id")
+    .eq("company_id", company_id)
+    .eq("idempotency_key", dispIdemKey)
+    .eq("result", "success")
+    .maybeSingle();
+  if (completedSync) return;
 
   // Mark contract executed timestamp (always safe to update)
   if (!record.contract_executed_at) {
-    await supabase.from("acquisition_records").update({
+    const { error } = await supabase.from("acquisition_records").update({
       contract_executed_at: new Date().toISOString(),
-    }).eq("id", record.id);
+    }).eq("id", record.id).eq("company_id", company_id);
+    if (error) throw error;
   }
 
   // Lock attribution snapshot (always safe)
   if (!record.attribution_snapshot || Object.keys(record.attribution_snapshot ?? {}).length === 0) {
-    await supabase.from("acquisition_records").update({
+    const { error } = await supabase.from("acquisition_records").update({
       attribution_snapshot: {
         assigned_user_id: record.assigned_user_id,
         lead_source: record.lead_source,
@@ -433,12 +504,12 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
         property_id: record.property_id,
         locked_at: new Date().toISOString(),
       },
-    }).eq("id", record.id);
+    }).eq("id", record.id).eq("company_id", company_id);
+    if (error) throw error;
   }
 
-  if (!alreadyRan) {
-    // ── Create Disposition Record ──────────────────────────────────────
-    // Check whether an active disposition already exists for this opportunity
+  // ── Create Disposition Record ──────────────────────────────────────
+  // Check whether an active disposition already exists for this opportunity
     const { data: existingDisp } = await supabase
       .from("disposition_records")
       .select("id, pipeline_stage_id")
@@ -449,16 +520,18 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
     let dispositionId: string | null = existingDisp?.id ?? null;
 
     if (!existingDisp) {
-      // Find "New Deal" disposition stage
+      // Keep the permanent workflow key even when the visible stage label is customized.
       const { data: newDealStage } = await supabase
         .from("disposition_pipeline_stages")
-        .select("id")
+        .select("id, name, position, stage_key")
         .eq("company_id", company_id)
-        .eq("name", "New Deal")
+        .eq("stage_key", "new_lead")
+        .order("position", { ascending: true })
+        .limit(1)
         .maybeSingle();
 
-      if (newDealStage && record.property_id && record.contact_id) {
-        const { data: newDisp } = await supabase
+      if (!newDealStage) throw new Error("Disposition entry stage is not configured");
+      const { data: newDisp, error: dispositionError } = await supabase
           .from("disposition_records")
           .insert({
             company_id,
@@ -474,8 +547,8 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
           })
           .select("id")
           .single();
+        if (dispositionError || !newDisp) throw dispositionError ?? new Error("Disposition record was not created");
         dispositionId = newDisp?.id ?? null;
-      }
     }
 
     // ── Create / Update Management Record ─────────────────────────────
@@ -488,13 +561,13 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
 
     const { data: existingMgmt } = await supabase
       .from("management_records")
-      .select("id")
+      .select("id, pipeline_stage_id")
       .eq("opportunity_id", record.opportunity_id)
       .maybeSingle();
 
     if (existingMgmt) {
       // Update the existing management record
-      await supabase.from("management_records").update({
+      const { error } = await supabase.from("management_records").update({
         acquisition_record_id: record.id,
         disposition_record_id: dispositionId,
         pipeline_stage_id: contractExecMgmtStage?.id ?? existingMgmt.pipeline_stage_id,
@@ -502,8 +575,9 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
         stage_entered_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }).eq("id", existingMgmt.id);
+      if (error) throw error;
     } else if (contractExecMgmtStage) {
-      await supabase.from("management_records").insert({
+      const { error } = await supabase.from("management_records").insert({
         company_id,
         opportunity_id: record.opportunity_id,
         acquisition_record_id: record.id,
@@ -513,6 +587,7 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
         acquisition_stage_snapshot: "Contract Executed",
         stage_entered_at: new Date().toISOString(),
       });
+      if (error) throw error;
     }
 
     // Create initial disposition tasks
@@ -530,16 +605,20 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
         .eq("related_opportunity_id", record.opportunity_id)
         .maybeSingle();
       if (!existing) {
-        await supabase.from("tasks").insert({
+        const { error } = await supabase.from("tasks").insert({
           company_id,
           title,
           status: "open",
           priority: "high",
           related_contact_id: record.contact_id ?? null,
           related_opportunity_id: record.opportunity_id ?? null,
-          assigned_to: record.assigned_user_id ?? null,
+          assigned_user_id: record.assigned_user_id ?? null,
+          created_by: metadata.changed_by ?? null,
+          is_automated: true,
+          automation_source: "contract_executed",
           due_date: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
         });
+        if (error) throw error;
       }
     }
 
@@ -556,7 +635,19 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
       },
       idempotency_key: `contract-executed-${record.id}-discord`,
     });
-  }
+
+  const { error: syncError } = await supabase.from("synchronization_events").upsert({
+    company_id,
+    entity_type: "acquisition_record",
+    entity_id: record.id,
+    source_pipeline: "acquisition",
+    target_pipeline: "disposition",
+    idempotency_key: dispIdemKey,
+    result: "success",
+    error_detail: null,
+    processed_at: new Date().toISOString(),
+  }, { onConflict: "idempotency_key" });
+  if (syncError) throw syncError;
 
   // Activity event (always write — shows re-entries too)
   await supabase.from("activity_events").insert({
@@ -566,9 +657,10 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
     event_type: "contract_executed",
     metadata: {
       locked_attribution: true,
-      disposition_created: !alreadyRan,
-      management_updated: !alreadyRan,
+      disposition_created: true,
+      management_updated: true,
     },
+    actor_id: metadata.changed_by ?? null,
   });
 
   // Notify assigned user
@@ -577,7 +669,7 @@ async function handleContractExecutedAutomation(supabase: any, company_id: strin
     user_id: record.assigned_user_id,
     type: "contract_executed",
     title: "Contract Executed",
-    body: `Contract executed. Disposition record ${alreadyRan ? "already exists" : "created"} and management record updated.`,
+    body: "Contract executed. The opportunity is now available in Dispositions / New Lead.",
     entity_type: "acquisition_record",
     entity_id: record.id,
     idempotency_key: `contract-executed-${record.id}-notif`,
@@ -804,7 +896,7 @@ async function executeAction(supabase: any, action: any, ctx: Record<string, unk
         entity_type: "acquisition_record",
         entity_id: ctx.record_id,
         body: config.note ?? "",
-        created_by: null,
+        author_id: null,
       });
       break;
     }

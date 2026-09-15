@@ -124,6 +124,8 @@ function CompanySettings() {
             />
             {logoUrl && (
               <div className="mt-2 flex items-center gap-2">
+                {/* User-supplied remote URLs cannot be restricted to a fixed Next Image host list. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={logoUrl} alt="Logo preview" className="h-10 w-10 rounded border border-border object-contain" />
                 <span className="text-xs text-muted-foreground">Preview</span>
               </div>

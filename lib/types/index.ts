@@ -322,8 +322,10 @@ export const PERMISSION_KEYS = [
   'view_all_revenue',
   'view_personal_earnings',
   'view_acquisitions',
+  'view_all_acquisition_leads',
   'edit_acquisitions',
   'view_dispositions',
+  'view_all_disposition_deals',
   'edit_dispositions',
   'view_management',
   'edit_management',
@@ -752,6 +754,7 @@ export interface AcquisitionPipelineStage {
   pipeline_definition_id: string;
   company_id: string;
   name: string;
+  stage_key: string | null;
   sort_order: number;
   is_system: boolean;
   color: string;
@@ -779,6 +782,7 @@ export interface AcquisitionRecord {
   offer_amount: number | null;
   offer_status: 'pending' | 'accepted' | 'declined' | 'expired' | 'withdrawn' | null;
   contract_executed_at: string | null;
+  contract_executed_by: string | null;
   attribution_snapshot: Record<string, unknown>;
   follow_up_active: boolean;
   follow_up_paused: boolean;
@@ -918,10 +922,13 @@ export interface DispositionPipelineStage {
   id: string;
   company_id: string;
   name: string;
+  stage_key: string | null;
   color: string;
   position: number;
   is_terminal: boolean;
+  is_system: boolean;
   created_at: string;
+  updated_at: string;
 }
 
 export interface ManagementPipelineStage {

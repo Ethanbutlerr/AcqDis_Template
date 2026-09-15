@@ -191,11 +191,13 @@ export default function LandingPage() {
           <div className="relative">
             <div className="absolute -inset-px rounded-xl bg-gradient-to-b from-[#F084F0]/20 via-transparent to-transparent opacity-60 pointer-events-none" />
             <div className="relative rounded-xl border border-white/[0.08] overflow-hidden shadow-2xl shadow-black/60">
-              <img
+              <Image
                 src="/demo-dashboard-new.webp"
                 alt="AcqDis CRM dashboard"
+                width={1600}
+                height={900}
                 className="w-full block"
-                loading="eager"
+                priority
               />
             </div>
           </div>
@@ -226,9 +228,11 @@ export default function LandingPage() {
             </FadeIn>
             <FadeIn delay={100}>
               <div className="relative rounded-xl border border-white/[0.08] overflow-hidden shadow-2xl shadow-black/50">
-                <img
+                <Image
                   src="/demo-pipeline-new.webp"
                   alt="Acquisitions pipeline"
+                  width={1600}
+                  height={900}
                   className="w-full block"
                   loading="lazy"
                 />
@@ -256,9 +260,11 @@ export default function LandingPage() {
             </FadeIn>
             <FadeIn className="order-1 lg:order-1">
               <div className="relative rounded-xl border border-white/[0.08] overflow-hidden shadow-2xl shadow-black/50">
-                <img
+                <Image
                   src="/demo-conversations-new.webp"
                   alt="Conversations inbox"
+                  width={1600}
+                  height={900}
                   className="w-full block"
                   loading="lazy"
                 />

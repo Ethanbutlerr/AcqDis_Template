@@ -36,13 +36,20 @@ const CAMPAIGN_STATUS_COLORS: Record<string, string> = {
   completed: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
 };
 
-const MEMBER_STATUS_META: Record<string, { icon: React.ComponentType<{ className?: string }>; color: string; label: string }> = {
-  enrolled:  { icon: Users,        color: 'text-slate-500',  label: 'No Response' },
-  active:    { icon: Send,         color: 'text-blue-600',   label: 'Sending' },
-  completed: { icon: CheckCircle2, color: 'text-green-600', label: 'Interested' },
-  stopped:   { icon: CheckCircle2, color: 'text-green-600', label: 'Responded' },
-  opted_out: { icon: Ban,          color: 'text-red-600',    label: 'Opted Out' },
-  removed:   { icon: Ban,          color: 'text-red-600',    label: 'Removed' },
+type CampaignDeliveryStatus = 'queued' | 'sent' | 'delivered' | 'responded' | 'suppressed' | 'failed';
+
+type CampaignMemberView = LeadCampaignMember & {
+  contact?: Contact;
+  deliveryStatus: CampaignDeliveryStatus;
+};
+
+const DELIVERY_STATUS_META: Record<CampaignDeliveryStatus, { icon: React.ComponentType<{ className?: string }>; color: string; label: string }> = {
+  queued:     { icon: Clock,        color: 'text-slate-500',   label: 'Queued' },
+  sent:       { icon: Send,         color: 'text-blue-600',    label: 'Sent' },
+  delivered:  { icon: CheckCircle2, color: 'text-emerald-600', label: 'Delivered' },
+  responded:  { icon: MessageSquare,color: 'text-green-600',   label: 'Responded' },
+  suppressed: { icon: Ban,          color: 'text-amber-600',   label: 'Suppressed' },
+  failed:     { icon: AlertCircle,  color: 'text-red-600',     label: 'Failed' },
 };
 
 type AudienceFilter = 'all' | 'seller' | 'buyer';
@@ -50,7 +57,10 @@ type AudienceFilter = 'all' | 'seller' | 'buyer';
 export default function SmsBlastsPage() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
-  const canEdit = hasPermission('send_buyer_sms_campaigns');
+  const canCreate = !!profile?.is_agency_admin || hasPermission('create_lead_campaigns');
+  const canEdit = !!profile?.is_agency_admin || hasPermission('edit_lead_campaigns');
+  const canStart = !!profile?.is_agency_admin || hasPermission('start_campaigns');
+  const canPause = !!profile?.is_agency_admin || hasPermission('pause_campaigns');
   const companyId = profile?.company_id ?? null;
 
   const [campaigns, setCampaigns] = useState<LeadCampaign[]>([]);
@@ -58,6 +68,11 @@ export default function SmsBlastsPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [selectedCampaignId, setSelectedCampaignId] = useState<string | null>(null);
   const [audienceFilter, setAudienceFilter] = useState<AudienceFilter>('all');
+
+  useEffect(() => {
+    const audience = new URLSearchParams(window.location.search).get('audience');
+    if (audience === 'seller' || audience === 'buyer') setAudienceFilter(audience);
+  }, []);
 
   const load = useCallback(async () => {
     if (!companyId) return;
@@ -92,7 +107,7 @@ export default function SmsBlastsPage() {
             {filteredCampaigns.length} campaigns · drip automation for sellers &amp; buyers
           </p>
         </div>
-        {canEdit && (
+        {canCreate && (
           <Button size="sm" className="gap-1.5" onClick={() => setShowCreate(true)}>
             <Plus className="h-4 w-4" /> New Blast
           </Button>
@@ -178,6 +193,8 @@ export default function SmsBlastsPage() {
           companyId={companyId}
           userId={profile?.id ?? null}
           canEdit={canEdit}
+          canStart={canStart}
+          canPause={canPause}
           onClose={() => setSelectedCampaignId(null)}
           onUpdated={load}
         />
@@ -294,19 +311,21 @@ function CreateCampaignDialog({
 // ─── Campaign Detail Sheet ───────────────────────────────────────────────────
 
 function CampaignDetailSheet({
-  campaignId, companyId, userId, canEdit, onClose, onUpdated,
+  campaignId, companyId, userId, canEdit, canStart, canPause, onClose, onUpdated,
 }: {
   campaignId: string;
   companyId: string;
   userId: string | null;
   canEdit: boolean;
+  canStart: boolean;
+  canPause: boolean;
   onClose: () => void;
   onUpdated: () => void;
 }) {
   const [campaign, setCampaign] = useState<LeadCampaign | null>(null);
   const [steps, setSteps] = useState<LeadSequenceStep[]>([]);
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
-  const [members, setMembers] = useState<(LeadCampaignMember & { contact?: Contact })[]>([]);
+  const [members, setMembers] = useState<CampaignMemberView[]>([]);
   const [showAddStep, setShowAddStep] = useState(false);
   const [showEnroll, setShowEnroll] = useState(false);
 
@@ -322,13 +341,73 @@ function CampaignDetailSheet({
     setTemplates((templatesRes.data ?? []) as MessageTemplate[]);
 
     const memberData = (membersRes.data ?? []) as LeadCampaignMember[];
-    const contactIds = Array.from(new Set(memberData.map((m) => m.lead_record_id).filter(Boolean))) as string[];
+    const leadIds = Array.from(new Set(memberData.map((m) => m.lead_record_id).filter(Boolean))) as string[];
+    const leadMap: Record<string, {
+      id: string;
+      contact_id: string;
+      response_status: string;
+      outreach_eligibility: string;
+      is_suppressed: boolean;
+    }> = {};
+    const latestMessageMap: Record<string, { status: string }> = {};
+
+    if (leadIds.length > 0) {
+      const leadIdBatches: string[][] = [];
+      for (let index = 0; index < leadIds.length; index += 50) {
+        leadIdBatches.push(leadIds.slice(index, index + 50));
+      }
+      const [leadsRes, ...messageResults] = await Promise.all([
+        supabase.from('lead_records')
+          .select('id, contact_id, response_status, outreach_eligibility, is_suppressed')
+          .eq('company_id', companyId)
+          .in('id', leadIds),
+        ...leadIdBatches.map((batch) => supabase.from('messages')
+          .select('lead_record_id, status, created_at')
+          .eq('company_id', companyId)
+          .eq('campaign_id', campaignId)
+          .eq('direction', 'outbound')
+          .in('lead_record_id', batch)
+          .order('created_at', { ascending: false })
+          .limit(1000)),
+      ]);
+      (leadsRes.data ?? []).forEach((lead) => { leadMap[lead.id] = lead; });
+      messageResults.forEach((messagesRes) => {
+        (messagesRes.data ?? []).forEach((message) => {
+          if (message.lead_record_id && !latestMessageMap[message.lead_record_id]) {
+            latestMessageMap[message.lead_record_id] = { status: message.status };
+          }
+        });
+      });
+    }
+
+    const contactIds = Array.from(new Set(Object.values(leadMap).map((lead) => lead.contact_id).filter(Boolean))) as string[];
     let contactMap: Record<string, Contact> = {};
     if (contactIds.length > 0) {
-      const { data: contacts } = await supabase.from('contacts').select('*').in('id', contactIds);
+      const { data: contacts } = await supabase.from('contacts').select('*').eq('company_id', companyId).in('id', contactIds);
       (contacts ?? []).forEach((c) => { contactMap[c.id] = c as Contact; });
     }
-    setMembers(memberData.map((m) => ({ ...m, contact: contactMap[m.lead_record_id] })));
+    setMembers(memberData.map((member) => {
+      const lead = leadMap[member.lead_record_id];
+      const latestMessage = latestMessageMap[member.lead_record_id];
+      let deliveryStatus: CampaignDeliveryStatus = 'queued';
+      if (
+        member.status === 'opted_out'
+        || member.status === 'removed'
+        || lead?.is_suppressed
+        || ['opted_out', 'wrong_number', 'do_not_contact'].includes(lead?.response_status ?? '')
+        || !['eligible', 'needs_review'].includes(lead?.outreach_eligibility ?? 'needs_review')
+      ) deliveryStatus = 'suppressed';
+      else if (lead?.response_status === 'responded') deliveryStatus = 'responded';
+      else if (['delivered', 'read'].includes(latestMessage?.status ?? '')) deliveryStatus = 'delivered';
+      else if (latestMessage?.status === 'sent') deliveryStatus = 'sent';
+      else if (latestMessage?.status === 'failed') deliveryStatus = 'failed';
+
+      return {
+        ...member,
+        contact: lead ? contactMap[lead.contact_id] : undefined,
+        deliveryStatus,
+      };
+    }));
   }, [campaignId, companyId]);
 
   useEffect(() => { load(); }, [load]);
@@ -386,16 +465,15 @@ function CampaignDetailSheet({
 
   // Auto-sorted member groups
   const memberGroups = useMemo(() => {
-    const groups: Record<string, typeof members> = {
-      interested: [],
-      no_response: [],
-      opted_out: [],
+    const groups: Record<CampaignDeliveryStatus, typeof members> = {
+      queued: [],
+      sent: [],
+      delivered: [],
+      responded: [],
+      suppressed: [],
+      failed: [],
     };
-    members.forEach((m) => {
-      if (m.status === 'completed' || m.status === 'stopped') groups.interested.push(m);
-      else if (m.status === 'opted_out' || m.status === 'removed') groups.opted_out.push(m);
-      else groups.no_response.push(m);
-    });
+    members.forEach((member) => groups[member.deliveryStatus].push(member));
     return groups;
   }, [members]);
 
@@ -414,17 +492,17 @@ function CampaignDetailSheet({
           <span className={cn('text-xs px-2 py-0.5 rounded font-medium', CAMPAIGN_STATUS_COLORS[campaign.status])}>
             {campaign.status}
           </span>
-          {canEdit && campaign.status === 'draft' && (
+          {canStart && campaign.status === 'draft' && (
             <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={() => updateStatus('active')}>
               <Play className="h-3 w-3" /> Activate
             </Button>
           )}
-          {canEdit && campaign.status === 'active' && (
+          {canPause && campaign.status === 'active' && (
             <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={() => updateStatus('paused')}>
               <Pause className="h-3 w-3" /> Pause
             </Button>
           )}
-          {canEdit && campaign.status === 'paused' && (
+          {canStart && campaign.status === 'paused' && (
             <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={() => updateStatus('active')}>
               <Play className="h-3 w-3" /> Resume
             </Button>
@@ -442,7 +520,7 @@ function CampaignDetailSheet({
           </div>
           <div className="rounded-lg border p-2 text-center">
             <p className="text-lg font-bold text-green-600">{campaign.total_responses}</p>
-            <p className="text-[10px] text-muted-foreground">Interested</p>
+            <p className="text-[10px] text-muted-foreground">Responses</p>
           </div>
           <div className="rounded-lg border p-2 text-center">
             <p className="text-lg font-bold text-red-600">{campaign.total_opt_outs}</p>
@@ -462,7 +540,7 @@ function CampaignDetailSheet({
             <div className="rounded-lg bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 p-3 text-xs text-blue-700 dark:text-blue-300">
               <Zap className="h-3.5 w-3.5 inline mr-1" />
               Messages send in sequence with delays between steps. Throttled to {campaign.daily_message_limit}/day to avoid carrier bans.
-              Steps with "Stop on response" auto-pause when a recipient replies.
+              Steps with &quot;Stop on response&quot; auto-pause when a recipient replies.
             </div>
             {steps.length === 0 ? (
               <p className="text-center py-8 text-sm text-muted-foreground">No sequence steps yet. Add steps to build your drip campaign.</p>
@@ -520,29 +598,35 @@ function CampaignDetailSheet({
               <p className="text-center py-8 text-sm text-muted-foreground">No recipients enrolled yet. Use the Enroll tab to add leads.</p>
             ) : (
               <>
-                {/* Interested */}
                 <MemberGroup
-                  title="Interested"
-                  icon={CheckCircle2}
-                  color="text-green-600"
-                  bgColor="bg-green-50 dark:bg-green-950/30"
-                  members={memberGroups.interested}
+                  title="Responded"
+                  status="responded"
+                  members={memberGroups.responded}
                 />
-                {/* No Response */}
                 <MemberGroup
-                  title="No Response"
-                  icon={Users}
-                  color="text-slate-500"
-                  bgColor="bg-slate-50 dark:bg-slate-900/30"
-                  members={memberGroups.no_response}
+                  title="Delivered"
+                  status="delivered"
+                  members={memberGroups.delivered}
                 />
-                {/* Opted Out / Wrong Number */}
                 <MemberGroup
-                  title="Not Interested / Opted Out"
-                  icon={Ban}
-                  color="text-red-600"
-                  bgColor="bg-red-50 dark:bg-red-950/30"
-                  members={memberGroups.opted_out}
+                  title="Sent"
+                  status="sent"
+                  members={memberGroups.sent}
+                />
+                <MemberGroup
+                  title="Queued"
+                  status="queued"
+                  members={memberGroups.queued}
+                />
+                <MemberGroup
+                  title="Suppressed / Review"
+                  status="suppressed"
+                  members={memberGroups.suppressed}
+                />
+                <MemberGroup
+                  title="Failed"
+                  status="failed"
+                  members={memberGroups.failed}
                 />
               </>
             )}
@@ -579,19 +663,19 @@ function CampaignDetailSheet({
 // ─── Member Group (auto-sorted) ───────────────────────────────────────────────
 
 function MemberGroup({
-  title, icon: Icon, color, bgColor, members,
+  title, status, members,
 }: {
   title: string;
-  icon: React.ComponentType<{ className?: string }>;
-  color: string;
-  bgColor: string;
-  members: (LeadCampaignMember & { contact?: Contact })[];
+  status: CampaignDeliveryStatus;
+  members: CampaignMemberView[];
 }) {
   if (members.length === 0) return null;
+  const meta = DELIVERY_STATUS_META[status];
+  const Icon = meta.icon;
   return (
-    <div className={cn('rounded-lg border p-3', bgColor)}>
+    <div className="rounded-lg border bg-card p-3">
       <div className="flex items-center gap-2 mb-2">
-        <Icon className={cn('h-4 w-4', color)} />
+        <Icon className={cn('h-4 w-4', meta.color)} />
         <span className="text-sm font-medium">{title}</span>
         <Badge variant="secondary" className="text-xs">{members.length}</Badge>
       </div>
@@ -599,8 +683,8 @@ function MemberGroup({
         {members.map((m) => {
           const contact = m.contact;
           const name = contact ? `${contact.first_name ?? ''} ${contact.last_name ?? ''}`.trim() || 'Unknown' : 'Unknown';
-          const meta = MEMBER_STATUS_META[m.status] ?? MEMBER_STATUS_META.enrolled;
-          const MetaIcon = meta.icon;
+          const memberMeta = DELIVERY_STATUS_META[m.deliveryStatus];
+          const MetaIcon = memberMeta.icon;
           return (
             <div key={m.id} className="rounded-md border bg-card p-2 flex items-center justify-between text-sm">
               <div className="min-w-0">
@@ -611,8 +695,8 @@ function MemberGroup({
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <span className="text-xs text-muted-foreground">Step {m.current_step_number}</span>
-                <span className={cn('text-[10px] flex items-center gap-0.5 font-medium', meta.color)}>
-                  <MetaIcon className="h-3 w-3" />{meta.label}
+                <span className={cn('text-[10px] flex items-center gap-0.5 font-medium', memberMeta.color)}>
+                  <MetaIcon className="h-3 w-3" />{memberMeta.label}
                 </span>
               </div>
             </div>

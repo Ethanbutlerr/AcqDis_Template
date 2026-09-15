@@ -35,7 +35,7 @@ export function PermissionGate({
             <CardContent className="flex flex-col items-center justify-center py-12 text-center">
               <ShieldX className="h-8 w-8 text-muted-foreground mb-2" />
               <p className="text-sm text-muted-foreground">
-                You don't have permission to view this content.
+                You don&apos;t have permission to view this content.
               </p>
             </CardContent>
           </Card>

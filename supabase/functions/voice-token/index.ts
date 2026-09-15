@@ -15,6 +15,53 @@ function getSupabase() {
   return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 }
 
+async function getTwilioCredentialMap(supabase: any, companyId: string) {
+  const { data } = await supabase
+    .from("company_credentials")
+    .select("credential_key, credential_value")
+    .eq("company_id", companyId)
+    .eq("provider", "twilio");
+  const credentials: Record<string, string> = {};
+  for (const row of data ?? []) credentials[row.credential_key] = row.credential_value;
+  return credentials;
+}
+
+async function authorizeUserRequest(req: Request, supabase: any, companyId: string, requestedUserId: string | undefined, permission: string) {
+  const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const { data: { user } } = await supabase.auth.getUser(token);
+  if (!user || (requestedUserId && requestedUserId !== user.id)) return null;
+
+  const { data: profile } = await supabase.from("profiles")
+    .select("id, company_id, is_disabled, is_agency_admin")
+    .eq("id", user.id)
+    .eq("company_id", companyId)
+    .maybeSingle();
+  if (!profile || profile.is_disabled) return null;
+  if (profile.is_agency_admin) return user;
+
+  const { data: memberships } = await supabase.from("user_roles")
+    .select("role_id")
+    .eq("user_id", user.id);
+  const roleIds = (memberships ?? []).map((membership: { role_id: string }) => membership.role_id);
+  if (!roleIds.length) return null;
+  const { data: companyRoles } = await supabase.from("roles")
+    .select("id")
+    .eq("company_id", companyId)
+    .in("id", roleIds);
+  const companyRoleIds = (companyRoles ?? []).map((role: { id: string }) => role.id);
+  if (!companyRoleIds.length) return null;
+  const { data: permissionRow } = await supabase.from("permissions").select("id").eq("key", permission).maybeSingle();
+  if (!permissionRow) return null;
+  const { data: rolePermission } = await supabase.from("role_permissions")
+    .select("role_id")
+    .eq("permission_id", permissionRow.id)
+    .in("role_id", companyRoleIds)
+    .limit(1)
+    .maybeSingle();
+  return rolePermission ? user : null;
+}
+
 function twimlResponse(twiml: string): Response {
   return new Response(twiml, {
     headers: { ...corsHeaders, "Content-Type": "text/xml" },
@@ -27,13 +74,97 @@ function twimlError(message: string): Response {
   );
 }
 
+function normalizePhone(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length === 10) return `1${digits}`;
+  return digits;
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function voiceIdentity(userId: string): string {
+  return `user_${userId.replace(/-/g, "_")}`;
+}
+
+async function getInboundRecipients(supabase: any, companyId: string, phoneNumber: any): Promise<string[]> {
+  const [{ data: profiles }, { data: permission }] = await Promise.all([
+    supabase.from("profiles").select("id, is_agency_admin").eq("company_id", companyId).eq("is_disabled", false),
+    supabase.from("permissions").select("id").eq("key", "view_calls").maybeSingle(),
+  ]);
+
+  const profileIds = new Set((profiles ?? []).map((profile: { id: string }) => profile.id));
+  const permittedIds = new Set(
+    (profiles ?? [])
+      .filter((profile: { is_agency_admin?: boolean }) => profile.is_agency_admin)
+      .map((profile: { id: string }) => profile.id),
+  );
+
+  if (permission?.id) {
+    const { data: rolePermissions } = await supabase
+      .from("role_permissions")
+      .select("role_id")
+      .eq("permission_id", permission.id);
+    const roleIds = (rolePermissions ?? []).map((row: { role_id: string }) => row.role_id);
+    if (roleIds.length) {
+      const { data: companyRoles } = await supabase.from("roles").select("id").eq("company_id", companyId).in("id", roleIds);
+      const companyRoleIds = (companyRoles ?? []).map((row: { id: string }) => row.id);
+      if (companyRoleIds.length) {
+        const { data: memberships } = await supabase.from("user_roles").select("user_id").in("role_id", companyRoleIds);
+        for (const membership of memberships ?? []) {
+          if (profileIds.has(membership.user_id)) permittedIds.add(membership.user_id);
+        }
+      }
+    }
+  }
+
+  if (phoneNumber.assigned_user_id && permittedIds.has(phoneNumber.assigned_user_id)) {
+    return [phoneNumber.assigned_user_id];
+  }
+
+  if (phoneNumber.assigned_team_id) {
+    const { data: teamMembers } = await supabase
+      .from("team_members")
+      .select("user_id")
+      .eq("team_id", phoneNumber.assigned_team_id);
+    const teamRecipients = (teamMembers ?? [])
+      .map((member: { user_id: string }) => member.user_id)
+      .filter((userId: string) => permittedIds.has(userId));
+    if (teamRecipients.length) return Array.from(new Set(teamRecipients)).slice(0, 10) as string[];
+  }
+
+  return Array.from(permittedIds).slice(0, 10) as string[];
+}
+
+async function validateTwilioWebhook(
+  req: Request,
+  params: Record<string, string>,
+  credentials: Record<string, string>,
+  configuredUrl?: string,
+): Promise<boolean> {
+  const signature = req.headers.get("x-twilio-signature") ?? "";
+  return Boolean(
+    credentials.auth_token
+      && signature
+      && twilio.validateRequest(credentials.auth_token, signature, configuredUrl || req.url, params),
+  );
+}
+
 async function handleRecordingCallback(req: Request): Promise<Response> {
   try {
     const formData = await req.formData();
-    const callSid = formData.get("CallSid") as string || "";
-    const recordingSid = formData.get("RecordingSid") as string || "";
-    const recordingUrl = formData.get("RecordingUrl") as string || "";
-    const recordingDuration = parseInt(formData.get("RecordingDuration") as string || "0", 10);
+    const callbackParams: Record<string, string> = {};
+    formData.forEach((value, key) => { callbackParams[key] = String(value); });
+    const callSid = callbackParams.CallSid || "";
+    const recordingSid = callbackParams.RecordingSid || "";
+    const recordingUrl = callbackParams.RecordingUrl || "";
+    const recordingDuration = parseInt(callbackParams.RecordingDuration || "0", 10);
 
     if (!callSid || !recordingSid) {
       return new Response("OK", { status: 200, headers: corsHeaders });
@@ -44,9 +175,17 @@ async function handleRecordingCallback(req: Request): Promise<Response> {
     // Update the existing row (created at call start) with recording details
     const { data: existing } = await supabase
       .from("call_recordings")
-      .select("id")
+      .select("id, company_id")
       .eq("call_sid", callSid)
       .maybeSingle();
+
+    if (!existing?.company_id) return new Response("OK", { status: 200, headers: corsHeaders });
+    const credentials = await getTwilioCredentialMap(supabase, existing.company_id);
+    const signature = req.headers.get("x-twilio-signature") ?? "";
+    const callbackUrl = Deno.env.get("TWILIO_RECORDING_CALLBACK_URL") || req.url;
+    if (!credentials.auth_token || !signature || !twilio.validateRequest(credentials.auth_token, signature, callbackUrl, callbackParams)) {
+      return new Response("Forbidden", { status: 403, headers: corsHeaders });
+    }
 
     if (existing) {
       await supabase
@@ -57,15 +196,6 @@ async function handleRecordingCallback(req: Request): Promise<Response> {
           duration_seconds: recordingDuration,
         })
         .eq("id", existing.id);
-    } else {
-      // Fallback: create a new row if the initial one wasn't created
-      await supabase.from("call_recordings").insert({
-        call_sid: callSid,
-        recording_sid: recordingSid,
-        recording_url: recordingUrl,
-        duration_seconds: recordingDuration,
-        company_id: null as any, // unknown at callback time
-      });
     }
 
     return new Response("OK", { status: 200, headers: corsHeaders });
@@ -75,16 +205,176 @@ async function handleRecordingCallback(req: Request): Promise<Response> {
   }
 }
 
+async function handleInboundStatusCallback(req: Request): Promise<Response> {
+  try {
+    const formData = await req.formData();
+    const callbackParams: Record<string, string> = {};
+    formData.forEach((value, key) => { callbackParams[key] = String(value); });
+    const callSid = callbackParams.CallSid || callbackParams.ParentCallSid || "";
+    if (!callSid) return new Response("OK", { status: 200, headers: corsHeaders });
+
+    const supabase = getSupabase();
+    const { data: call } = await supabase
+      .from("calls")
+      .select("id, company_id, phone_number_id, from_number, answered_at")
+      .eq("call_sid", callSid)
+      .eq("direction", "inbound")
+      .maybeSingle();
+    if (!call?.company_id) return new Response("OK", { status: 200, headers: corsHeaders });
+
+    const credentials = await getTwilioCredentialMap(supabase, call.company_id);
+    const valid = await validateTwilioWebhook(
+      req,
+      callbackParams,
+      credentials,
+      Deno.env.get("TWILIO_INBOUND_STATUS_CALLBACK_URL") || undefined,
+    );
+    if (!valid) return new Response("Forbidden", { status: 403, headers: corsHeaders });
+
+    const dialStatus = callbackParams.DialCallStatus || callbackParams.CallStatus || "";
+    const duration = parseInt(callbackParams.DialCallDuration || callbackParams.CallDuration || "0", 10);
+    const completed = dialStatus === "completed";
+    const failed = dialStatus === "failed";
+    const missed = ["busy", "no-answer", "canceled"].includes(dialStatus) || (!completed && !failed);
+    const status = completed ? "completed" : failed ? "failed" : "missed";
+
+    await supabase.from("calls").update({
+      status,
+      duration_seconds: duration > 0 ? duration : null,
+      ended_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }).eq("id", call.id);
+
+    if (missed && call.phone_number_id) {
+      const { data: phoneNumber } = await supabase.from("phone_numbers").select("*").eq("id", call.phone_number_id).maybeSingle();
+      if (phoneNumber) {
+        const recipientIds = await getInboundRecipients(supabase, call.company_id, phoneNumber);
+        for (const userId of recipientIds) {
+          const { data: existing } = await supabase.from("notifications")
+            .select("id")
+            .eq("user_id", userId)
+            .eq("type", "missed_call")
+            .eq("entity_type", "call")
+            .eq("entity_id", call.id)
+            .maybeSingle();
+          if (!existing) {
+            await supabase.from("notifications").insert({
+              company_id: call.company_id,
+              user_id: userId,
+              type: "missed_call",
+              title: "Missed call",
+              body: `Missed incoming call from ${call.from_number || "an unknown number"}.`,
+              entity_type: "call",
+              entity_id: call.id,
+            });
+          }
+        }
+      }
+    }
+
+    return new Response("OK", { status: 200, headers: corsHeaders });
+  } catch (err) {
+    console.error("Inbound call status callback error:", err);
+    return new Response("OK", { status: 200, headers: corsHeaders });
+  }
+}
+
 async function handleTwimlWebhook(req: Request): Promise<Response> {
   try {
     const formData = await req.formData();
-    const to = formData.get("To") as string || "";
-    const companyId = formData.get("CompanyId") as string || "";
-    const userId = formData.get("UserId") as string || "";
-    const callSid = formData.get("CallSid") as string || "";
+    const webhookParams: Record<string, string> = {};
+    formData.forEach((value, key) => { webhookParams[key] = String(value); });
+    const to = webhookParams.To || "";
+    let companyId = webhookParams.CompanyId || "";
+    const userId = webhookParams.UserId || "";
+    const callSid = webhookParams.CallSid || "";
 
     if (!to) {
       return twimlError("No destination number provided.");
+    }
+
+    const supabase = getSupabase();
+    let inboundPhoneNumber: any = null;
+    if (!companyId) {
+      const { data: candidates } = await supabase
+        .from("phone_numbers")
+        .select("id, company_id, number, assigned_user_id, assigned_team_id")
+        .eq("provider", "twilio")
+        .eq("registration_status", "registered")
+        .eq("is_active", true);
+      inboundPhoneNumber = (candidates ?? []).find((number: { number: string }) => normalizePhone(number.number) === normalizePhone(to));
+      companyId = inboundPhoneNumber?.company_id || "";
+    }
+
+    if (!companyId) return new Response("Forbidden", { status: 403, headers: corsHeaders });
+    const credentials = await getTwilioCredentialMap(supabase, companyId);
+    const valid = await validateTwilioWebhook(
+      req,
+      webhookParams,
+      credentials,
+      Deno.env.get("TWILIO_VOICE_WEBHOOK_URL") || undefined,
+    );
+    if (!valid) {
+      return new Response("Forbidden", { status: 403, headers: corsHeaders });
+    }
+
+    if (inboundPhoneNumber) {
+      const callerNumber = webhookParams.From || webhookParams.Caller || "";
+      const normalizedCaller = normalizePhone(callerNumber);
+      const { data: contact } = await supabase.from("contacts")
+        .select("id, first_name, last_name")
+        .eq("company_id", companyId)
+        .eq("primary_phone_normalized", normalizedCaller)
+        .limit(1)
+        .maybeSingle();
+      const { data: conversation } = contact?.id
+        ? await supabase.from("conversations").select("id").eq("company_id", companyId).eq("contact_id", contact.id).limit(1).maybeSingle()
+        : { data: null };
+      const callerName = [contact?.first_name, contact?.last_name].filter(Boolean).join(" ") || "Unknown caller";
+      const recipientIds = await getInboundRecipients(supabase, companyId, inboundPhoneNumber);
+      if (!recipientIds.length) return twimlError("No team member is available to receive this call.");
+
+      let callId = "";
+      const { data: existingCall } = await supabase.from("calls").select("id").eq("call_sid", callSid).eq("direction", "inbound").maybeSingle();
+      if (existingCall?.id) {
+        callId = existingCall.id;
+      } else {
+        const { data: createdCall } = await supabase.from("calls").insert({
+          company_id: companyId,
+          conversation_id: conversation?.id || null,
+          contact_id: contact?.id || null,
+          phone_number_id: inboundPhoneNumber.id,
+          direction: "inbound",
+          status: "ringing",
+          from_number: callerNumber || null,
+          to_number: to,
+          call_sid: callSid || null,
+          is_simulated: false,
+          started_at: new Date().toISOString(),
+        }).select("id").single();
+        callId = createdCall?.id || "";
+        if (callId && callSid) {
+          await supabase.from("call_recordings").insert({
+            company_id: companyId,
+            call_sid: callSid,
+            from_number: callerNumber || null,
+            to_number: to,
+            user_id: null,
+          });
+        }
+      }
+
+      const callbackUrl = `${SUPABASE_URL}/functions/v1/voice-token?action=inbound-status`;
+      const recordingCallback = `${SUPABASE_URL}/functions/v1/voice-token?action=recording-callback`;
+      const clients = recipientIds.map((recipientId) => (
+        `<Client><Identity>${xmlEscape(voiceIdentity(recipientId))}</Identity>`
+        + `<Parameter name="CallId" value="${xmlEscape(callId)}"/>`
+        + `<Parameter name="CallerName" value="${xmlEscape(callerName)}"/>`
+        + `<Parameter name="CallerNumber" value="${xmlEscape(callerNumber)}"/>`
+        + `</Client>`
+      )).join("");
+      const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Dial answerOnBridge="true" timeout="30" record="record-from-answer-dual" action="${xmlEscape(callbackUrl)}" method="POST" recordingStatusCallback="${xmlEscape(recordingCallback)}" recordingStatusCallbackMethod="POST">${clients}</Dial></Response>`;
+      return twimlResponse(twiml);
     }
 
     const formattedTo = to.startsWith("+") ? to : `+${to}`;
@@ -92,12 +382,11 @@ async function handleTwimlWebhook(req: Request): Promise<Response> {
     // Try to resolve a caller ID from the database
     let callerId = "";
     try {
-      const supabase = getSupabase();
-
       if (userId && companyId) {
         const { data: pn } = await supabase
           .from("phone_numbers").select("number")
           .eq("company_id", companyId).eq("assigned_user_id", userId).eq("is_active", true)
+          .eq("provider", "twilio").eq("registration_status", "registered").not("provider_reference", "is", null)
           .limit(1).maybeSingle();
         if (pn) callerId = pn.number;
       }
@@ -105,6 +394,7 @@ async function handleTwimlWebhook(req: Request): Promise<Response> {
         const { data: pn } = await supabase
           .from("phone_numbers").select("number")
           .eq("company_id", companyId).eq("is_default", true).eq("is_active", true)
+          .eq("provider", "twilio").eq("registration_status", "registered").not("provider_reference", "is", null)
           .limit(1).maybeSingle();
         if (pn) callerId = pn.number;
       }
@@ -112,6 +402,7 @@ async function handleTwimlWebhook(req: Request): Promise<Response> {
         const { data: pn } = await supabase
           .from("phone_numbers").select("number")
           .eq("company_id", companyId).eq("is_active", true)
+          .eq("provider", "twilio").eq("registration_status", "registered").not("provider_reference", "is", null)
           .limit(1).maybeSingle();
         if (pn) callerId = pn.number;
       }
@@ -173,6 +464,10 @@ Deno.serve(async (req: Request) => {
     return handleRecordingCallback(req);
   }
 
+  if (url.searchParams.get("action") === "inbound-status" && contentType.includes("application/x-www-form-urlencoded")) {
+    return handleInboundStatusCallback(req);
+  }
+
   // Handle TwiML webhook from Twilio (form-urlencoded POST)
   if (contentType.includes("application/x-www-form-urlencoded")) {
     return handleTwimlWebhook(req);
@@ -183,23 +478,24 @@ Deno.serve(async (req: Request) => {
     const supabase = getSupabase();
 
     const body = await req.json();
-    const { action, company_id, user_id } = body as {
+    const { action, company_id, user_id, phone_number_id } = body as {
       action: string;
       company_id: string;
       user_id?: string;
+      phone_number_id?: string;
     };
 
     // Resolve company Twilio credentials
-    const { data: credRows } = await supabase
-      .from("company_credentials")
-      .select("credential_key, credential_value")
-      .eq("company_id", company_id)
-      .eq("provider", "twilio");
-
-    const credMap: Record<string, string> = {};
-    for (const row of credRows ?? []) {
-      credMap[row.credential_key] = row.credential_value;
+    const requiredPermission = ["sync_numbers", "configure_inbound"].includes(action) ? "manage_phone_numbers" : "view_calls";
+    const authorizedUser = await authorizeUserRequest(req, supabase, company_id, user_id, requiredPermission);
+    if (!authorizedUser) {
+      return new Response(JSON.stringify({ error: "Not authorized" }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
+
+    const credMap = await getTwilioCredentialMap(supabase, company_id);
 
     const accountSid = credMap.account_sid;
     const authToken = credMap.auth_token;
@@ -233,7 +529,7 @@ Deno.serve(async (req: Request) => {
       const { AccessToken } = twilio.jwt;
       const { VoiceGrant } = AccessToken;
 
-      const identity = user_id ?? "agent";
+      const identity = voiceIdentity(authorizedUser.id);
       const token = new AccessToken(accountSid, apiKeySid, apiKeySecret, { identity });
       const voiceGrant = new VoiceGrant({
         outgoingApplicationSid: twimlAppSid,
@@ -245,6 +541,92 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({ success: true, token: token.toJwt(), identity }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
+    }
+
+    if (action === "sync_numbers") {
+      const client = twilio(accountSid, authToken);
+      const incomingNumbers = await client.incomingPhoneNumbers.list({ limit: 1000 });
+      const actualNumbers = new Set(incomingNumbers.map((number) => number.phoneNumber));
+
+      for (const number of incomingNumbers) {
+        const { error } = await supabase.from("phone_numbers").upsert({
+          company_id,
+          number: number.phoneNumber,
+          friendly_name: number.friendlyName || number.phoneNumber,
+          provider: "twilio",
+          provider_reference: number.sid,
+          registration_status: "registered",
+          is_mock: false,
+          is_active: true,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: "company_id,number" });
+        if (error) throw error;
+      }
+
+      const { data: storedNumbers } = await supabase.from("phone_numbers")
+        .select("id, number")
+        .eq("company_id", company_id)
+        .eq("provider", "twilio");
+      for (const stored of storedNumbers ?? []) {
+        if (!actualNumbers.has(stored.number)) {
+          await supabase.from("phone_numbers").update({
+            is_active: false,
+            registration_status: "unregistered",
+            updated_at: new Date().toISOString(),
+          }).eq("id", stored.id).eq("company_id", company_id);
+        }
+      }
+
+      return new Response(JSON.stringify({ success: true, count: incomingNumbers.length }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "configure_inbound") {
+      if (!twimlAppSid) {
+        return new Response(
+          JSON.stringify({ error: "Add the TwiML App SID in Settings > Integrations before enabling incoming calls." }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      if (!phone_number_id) {
+        return new Response(JSON.stringify({ error: "A phone number is required." }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const { data: phoneNumber } = await supabase.from("phone_numbers")
+        .select("id, provider_reference")
+        .eq("id", phone_number_id)
+        .eq("company_id", company_id)
+        .eq("provider", "twilio")
+        .eq("registration_status", "registered")
+        .maybeSingle();
+      if (!phoneNumber?.provider_reference) {
+        return new Response(JSON.stringify({ error: "Sync this Twilio number before enabling incoming calls." }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const client = twilio(accountSid, authToken);
+      await client.incomingPhoneNumbers(phoneNumber.provider_reference).update({
+        voiceApplicationSid: twimlAppSid,
+        voiceMethod: "POST",
+      });
+      await supabase.from("phone_numbers").update({
+        inbound_routing: {
+          mode: "browser",
+          voice_application_sid: twimlAppSid,
+          configured_at: new Date().toISOString(),
+        },
+        updated_at: new Date().toISOString(),
+      }).eq("id", phoneNumber.id);
+
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     return new Response(

@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Card, CardContent } from '@/components/ui/card';
-import { Loader2, Phone, Plus, Settings, Lock, Star } from 'lucide-react';
+import { CheckCircle2, Loader2, Phone, PhoneIncoming, RefreshCw, Settings, Lock, Star } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 function RegistrationBadge({ status }: { status: string }) {
@@ -38,23 +38,24 @@ export default function PhoneNumbersPage() {
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [addingNew, setAddingNew] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState('');
 
   // Form state
   const [formFriendlyName, setFormFriendlyName] = useState('');
-  const [formNumber, setFormNumber] = useState('');
   const [formType, setFormType] = useState('personal');
-  const [formProvider, setFormProvider] = useState('twilio');
   const [formUserId, setFormUserId] = useState<string | null>(null);
   const [formActive, setFormActive] = useState(true);
   const [formDefault, setFormDefault] = useState(false);
   const [formDailyLimit, setFormDailyLimit] = useState<string>('');
   const [formSaving, setFormSaving] = useState(false);
+  const [configuringInbound, setConfiguringInbound] = useState(false);
 
   const load = useCallback(async () => {
     if (!companyId) return;
     const [numRes, usersRes] = await Promise.all([
-      supabase.from('phone_numbers').select('*').eq('company_id', companyId).order('created_at'),
+      supabase.from('phone_numbers').select('*').eq('company_id', companyId)
+        .eq('provider', 'twilio').not('provider_reference', 'is', null).order('created_at'),
       supabase.from('profiles').select('id, full_name, avatar_url').eq('company_id', companyId).eq('is_disabled', false).order('full_name'),
     ]);
     setNumbers((numRes.data ?? []) as PhoneNumberFull[]);
@@ -67,30 +68,15 @@ export default function PhoneNumbersPage() {
   const openEdit = (num: PhoneNumberFull) => {
     setEditingId(num.id);
     setFormFriendlyName(num.friendly_name ?? num.label ?? '');
-    setFormNumber(num.number);
     setFormType(num.number_type);
-    setFormProvider(num.provider);
     setFormUserId(num.assigned_user_id ?? null);
     setFormActive(num.is_active);
     setFormDefault(num.is_default);
     setFormDailyLimit(num.daily_send_limit != null ? String(num.daily_send_limit) : '');
   };
 
-  const openAdd = () => {
-    setEditingId(null);
-    setFormFriendlyName('');
-    setFormNumber('');
-    setFormType('personal');
-    setFormProvider('twilio');
-    setFormDefault(false);
-    setFormDailyLimit('');
-    setFormUserId(null);
-    setFormActive(true);
-    setAddingNew(true);
-  };
-
   const saveForm = async () => {
-    if (!companyId || !formNumber.trim()) return;
+    if (!companyId || !editingId) return;
     setFormSaving(true);
 
     // If marking as default, unset other defaults first
@@ -99,30 +85,37 @@ export default function PhoneNumbersPage() {
     }
 
     const payload = {
-      company_id: companyId,
       friendly_name: formFriendlyName || null,
-      number: formNumber.trim(),
       label: formFriendlyName || null,
       number_type: formType,
-      provider: formProvider,
-      is_mock: false,
       assigned_user_id: formUserId || null,
       is_active: formActive,
       is_default: formDefault,
       daily_send_limit: formDailyLimit.trim() ? parseInt(formDailyLimit, 10) : null,
-      registration_status: 'registered',
     };
 
-    if (editingId) {
-      await supabase.from('phone_numbers').update({ ...payload, updated_at: new Date().toISOString() }).eq('id', editingId);
-    } else {
-      await supabase.from('phone_numbers').insert(payload);
-    }
+    await supabase.from('phone_numbers').update({ ...payload, updated_at: new Date().toISOString() })
+      .eq('id', editingId).eq('company_id', companyId).eq('provider', 'twilio').not('provider_reference', 'is', null);
 
     setFormSaving(false);
     setEditingId(null);
-    setAddingNew(false);
     load();
+  };
+
+  const syncNumbers = async () => {
+    if (!companyId || !profile?.id || !canManage) return;
+    setSyncing(true);
+    setSyncMessage('');
+    const { data, error } = await supabase.functions.invoke('voice-token', {
+      body: { action: 'sync_numbers', company_id: companyId, user_id: profile.id },
+    });
+    setSyncing(false);
+    if (error || data?.error) {
+      setSyncMessage(data?.error || error?.message || 'Unable to sync Twilio numbers.');
+      return;
+    }
+    setSyncMessage(`${data?.count ?? 0} Twilio number${data?.count === 1 ? '' : 's'} synchronized.`);
+    await load();
   };
 
   const toggleActive = async (num: PhoneNumberFull) => {
@@ -131,13 +124,35 @@ export default function PhoneNumbersPage() {
     load();
   };
 
-  const isDrawerOpen = !!editingId || addingNew;
+  const configureInbound = async (num: PhoneNumberFull) => {
+    if (!companyId || !profile?.id || !canManage) return;
+    setConfiguringInbound(true);
+    setSyncMessage('');
+    const { data, error } = await supabase.functions.invoke('voice-token', {
+      body: {
+        action: 'configure_inbound',
+        company_id: companyId,
+        user_id: profile.id,
+        phone_number_id: num.id,
+      },
+    });
+    setConfiguringInbound(false);
+    if (error || data?.error) {
+      setSyncMessage(data?.error || error?.message || 'Unable to enable incoming calls.');
+      return;
+    }
+    setSyncMessage(`Incoming browser calls enabled for ${num.number}.`);
+    await load();
+  };
+
+  const isDrawerOpen = !!editingId;
+  const editingNumber = numbers.find((number) => number.id === editingId) ?? null;
 
   if (!hasPermission('manage_phone_numbers') && !hasPermission('view_conversations')) {
     return (
       <div className="flex flex-col items-center justify-center h-48 gap-3">
         <Lock className="h-8 w-8 text-muted-foreground" />
-        <p className="text-sm text-muted-foreground">You don't have permission to view phone numbers.</p>
+        <p className="text-sm text-muted-foreground">You don&apos;t have permission to view phone numbers.</p>
       </div>
     );
   }
@@ -148,15 +163,17 @@ export default function PhoneNumbersPage() {
         <div>
           <h2 className="text-base font-semibold">Phone Numbers</h2>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Manage your company's phone numbers for SMS and calls. All messages are sent via Twilio.
+            Assign and configure phone numbers verified from your connected Twilio account.
           </p>
         </div>
         {canManage && (
-          <Button size="sm" className="gap-1.5" onClick={openAdd}>
-            <Plus className="h-3.5 w-3.5" /> Add Number
+          <Button size="sm" className="gap-1.5" onClick={syncNumbers} disabled={syncing}>
+            {syncing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            Sync from Twilio
           </Button>
         )}
       </div>
+      {syncMessage && <p className="text-xs text-muted-foreground">{syncMessage}</p>}
 
       {loading ? (
         <div className="flex items-center justify-center py-16">
@@ -180,7 +197,7 @@ export default function PhoneNumbersPage() {
               {numbers.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={7} className="text-center py-8 text-xs text-muted-foreground">
-                    No phone numbers configured
+                    No verified Twilio phone numbers found. Sync after connecting Twilio in Integrations.
                   </TableCell>
                 </TableRow>
               ) : numbers.map((num) => {
@@ -200,6 +217,11 @@ export default function PhoneNumbersPage() {
                             )}
                           </div>
                           <p className="text-[10px] text-muted-foreground font-mono">{num.number}</p>
+                          {num.inbound_routing?.mode === 'browser' && (
+                            <span className="mt-0.5 inline-flex items-center gap-1 text-[9px] text-emerald-500">
+                              <PhoneIncoming className="h-2.5 w-2.5" /> Incoming ready
+                            </span>
+                          )}
                         </div>
                       </div>
                     </TableCell>
@@ -242,20 +264,16 @@ export default function PhoneNumbersPage() {
         </Card>
       )}
 
-      {/* Add / Edit Drawer */}
-      <Sheet open={isDrawerOpen} onOpenChange={(open) => { if (!open) { setEditingId(null); setAddingNew(false); } }}>
+      {/* Edit Drawer */}
+      <Sheet open={isDrawerOpen} onOpenChange={(open) => { if (!open) setEditingId(null); }}>
         <SheetContent className="w-[380px] max-w-full overflow-y-auto">
           <SheetHeader>
-            <SheetTitle>{editingId ? 'Edit Phone Number' : 'Add Phone Number'}</SheetTitle>
+            <SheetTitle>Edit Phone Number</SheetTitle>
           </SheetHeader>
           <div className="space-y-4 mt-4">
             <div className="space-y-1.5">
               <Label className="text-xs">Friendly Name</Label>
               <Input value={formFriendlyName} onChange={(e) => setFormFriendlyName(e.target.value)} placeholder="e.g. Acquisition Hotline" className="h-8 text-sm" />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs">Phone Number</Label>
-              <Input value={formNumber} onChange={(e) => setFormNumber(e.target.value)} placeholder="+15550001234" className="h-8 text-sm font-mono" />
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Number Type</Label>
@@ -269,21 +287,11 @@ export default function PhoneNumbersPage() {
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">Provider</Label>
-              <Select value={formProvider} onValueChange={setFormProvider}>
-                <SelectTrigger className="h-8 text-sm"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="twilio" className="text-sm">Twilio</SelectItem>
-                </SelectContent>
-              </Select>
-
-            </div>
-            <div className="space-y-1.5">
               <Label className="text-xs">Assign to User</Label>
-              <Select value={formUserId ?? ''} onValueChange={(v) => setFormUserId(v || null)}>
+              <Select value={formUserId ?? 'unassigned'} onValueChange={(v) => setFormUserId(v === 'unassigned' ? null : v)}>
                 <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="Unassigned" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="" className="text-sm">Unassigned</SelectItem>
+                  <SelectItem value="unassigned" className="text-sm">Unassigned</SelectItem>
                   {users.map((u) => (
                     <SelectItem key={u.id} value={u.id} className="text-sm">{u.full_name}</SelectItem>
                   ))}
@@ -314,10 +322,27 @@ export default function PhoneNumbersPage() {
               />
               <p className="text-[10px] text-muted-foreground">Max texts per day during carrier ramp-up. Leave empty for no limit.</p>
             </div>
-            <Button className="w-full" onClick={saveForm} disabled={formSaving || !formNumber.trim()}>
+            <Button className="w-full" onClick={saveForm} disabled={formSaving || !editingId}>
               {formSaving ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-              {editingId ? 'Save Changes' : 'Add Number'}
+              Save Changes
             </Button>
+            {editingNumber && (
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => configureInbound(editingNumber)}
+                disabled={configuringInbound || editingNumber.inbound_routing?.mode === 'browser'}
+              >
+                {configuringInbound ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : editingNumber.inbound_routing?.mode === 'browser' ? (
+                  <CheckCircle2 className="mr-2 h-4 w-4 text-emerald-500" />
+                ) : (
+                  <PhoneIncoming className="mr-2 h-4 w-4" />
+                )}
+                {editingNumber.inbound_routing?.mode === 'browser' ? 'Incoming Calls Enabled' : 'Enable Incoming Calls'}
+              </Button>
+            )}
           </div>
         </SheetContent>
       </Sheet>

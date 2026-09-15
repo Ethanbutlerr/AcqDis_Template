@@ -18,6 +18,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { NotesSection } from '@/components/notes-section';
 import { ActivityTimeline } from '@/components/activity-timeline';
 import { CustomFieldsSection } from '@/components/custom-fields-section';
+import { StageMoveDialog } from '@/components/stage-move-dialog';
+import { movePipelineStage } from '@/lib/utils/pipeline-stage';
 import { Phone, Mail, MessageSquare, Plus, Trash2, ListTodo, PhoneCall, PhoneOff, CheckCircle2, XCircle, Loader2 as Spinner } from 'lucide-react';
 
 export function ContactDrawer({
@@ -51,10 +53,13 @@ export function ContactDrawer({
   const [newPhone, setNewPhone] = useState({ phone: '', label: 'mobile' });
   const [newEmail, setNewEmail] = useState({ email: '', label: 'personal' });
   const [showTaskDialog, setShowTaskDialog] = useState(false);
-  const [acqRecord, setAcqRecord] = useState<{ id: string; pipeline_stage_id: string | null; archived_at: string | null; motivation: string | null; seller_timeline: string | null; asking_price: number | null; estimated_arv: number | null; estimated_repair_cost: number | null; offer_amount: number | null; offer_status: string | null; last_contacted_at: string | null; stage_entered_at: string | null; created_at: string | null } | null>(null);
+  const [acqRecord, setAcqRecord] = useState<{ id: string; opportunity_id: string | null; pipeline_stage_id: string | null; archived_at: string | null; motivation: string | null; seller_timeline: string | null; asking_price: number | null; estimated_arv: number | null; estimated_repair_cost: number | null; offer_amount: number | null; offer_status: string | null; last_contacted_at: string | null; stage_entered_at: string | null; created_at: string | null } | null>(null);
   const [acqProperty, setAcqProperty] = useState<Property | null>(null);
-  const [acqStages, setAcqStages] = useState<{ id: string; name: string; sort_order: number }[]>([]);
+  const [acqStages, setAcqStages] = useState<{ id: string; name: string; stage_key: string | null; sort_order: number }[]>([]);
   const [movingStage, setMovingStage] = useState(false);
+  const [pendingStageName, setPendingStageName] = useState<string | null>(null);
+  const [pendingStageRequestId, setPendingStageRequestId] = useState<string | null>(null);
+  const [stageMoveError, setStageMoveError] = useState('');
 
   const loadContact = useCallback(async () => {
     const { data } = await supabase.from('contacts').select('*').eq('id', contactId).maybeSingle();
@@ -90,15 +95,15 @@ export function ContactDrawer({
 
   const loadAcquisitionData = useCallback(async () => {
     const [recordRes, stagesRes] = await Promise.all([
-      supabase.from('acquisition_records').select('id, pipeline_stage_id, archived_at, motivation, seller_timeline, asking_price, estimated_arv, estimated_repair_cost, offer_amount, offer_status, last_contacted_at, stage_entered_at, created_at, properties(*)').eq('contact_id', contactId).eq('company_id', companyId).is('archived_at', null).order('created_at', { ascending: false }).limit(1).maybeSingle(),
-      supabase.from('acquisition_pipeline_stages').select('id, name, sort_order').eq('company_id', companyId).order('sort_order'),
+      supabase.from('acquisition_records').select('id, opportunity_id, pipeline_stage_id, archived_at, motivation, seller_timeline, asking_price, estimated_arv, estimated_repair_cost, offer_amount, offer_status, last_contacted_at, stage_entered_at, created_at, properties(*)').eq('contact_id', contactId).eq('company_id', companyId).is('archived_at', null).order('created_at', { ascending: false }).limit(1).maybeSingle(),
+      supabase.from('acquisition_pipeline_stages').select('id, name, stage_key, sort_order').eq('company_id', companyId).order('sort_order'),
     ]);
     const rec = recordRes.data as (typeof acqRecord & { properties?: Property }) | null;
     if (rec?.properties) {
       setAcqProperty(rec.properties);
     }
-    setAcqRecord(rec ? { id: rec.id, pipeline_stage_id: rec.pipeline_stage_id, archived_at: rec.archived_at, motivation: rec.motivation, seller_timeline: rec.seller_timeline, asking_price: rec.asking_price, estimated_arv: rec.estimated_arv, estimated_repair_cost: rec.estimated_repair_cost, offer_amount: rec.offer_amount, offer_status: rec.offer_status, last_contacted_at: rec.last_contacted_at, stage_entered_at: rec.stage_entered_at, created_at: rec.created_at } : null);
-    setAcqStages((stagesRes.data ?? []) as { id: string; name: string; sort_order: number }[]);
+    setAcqRecord(rec ? { id: rec.id, opportunity_id: rec.opportunity_id, pipeline_stage_id: rec.pipeline_stage_id, archived_at: rec.archived_at, motivation: rec.motivation, seller_timeline: rec.seller_timeline, asking_price: rec.asking_price, estimated_arv: rec.estimated_arv, estimated_repair_cost: rec.estimated_repair_cost, offer_amount: rec.offer_amount, offer_status: rec.offer_status, last_contacted_at: rec.last_contacted_at, stage_entered_at: rec.stage_entered_at, created_at: rec.created_at } : null);
+    setAcqStages((stagesRes.data ?? []) as { id: string; name: string; stage_key: string | null; sort_order: number }[]);
   }, [contactId, companyId]);
 
   useEffect(() => {
@@ -187,43 +192,52 @@ export function ContactDrawer({
 
   const isSeller = contactTypes.some((t) => t.name === 'Seller' && selectedTypes.includes(t.id));
 
-  const moveToStage = async (stageName: string) => {
-    if (!acqRecord) return;
+  const moveToStage = async (stageKey: string) => {
+    const stage = acqStages.find((candidate) => candidate.stage_key === stageKey);
+    if (!acqRecord || !stage || stage.id === acqRecord.pipeline_stage_id) return;
+    setPendingStageName(stage.name);
+    setPendingStageRequestId(crypto.randomUUID());
+  };
+
+  const confirmStageMove = async (note: string) => {
+    if (!acqRecord || !acqRecord.pipeline_stage_id || !pendingStageName || !pendingStageRequestId) return false;
     setMovingStage(true);
-    const stage = acqStages.find((s) => s.name === stageName);
+    setStageMoveError('');
+    const fromStageId = acqRecord.pipeline_stage_id;
+    const stage = acqStages.find((s) => s.name === pendingStageName);
     if (stage) {
-      await supabase.from('acquisition_records').update({
-        pipeline_stage_id: stage.id,
-        stage_entered_at: new Date().toISOString(),
-      }).eq('id', acqRecord.id);
-      setAcqRecord({ ...acqRecord, pipeline_stage_id: stage.id });
-      await logActivity({ companyId, actorId: user?.id, entityType: 'acquisition_record', entityId: acqRecord.id, eventType: 'stage_changed', metadata: { stage: stageName } });
+      try {
+        setAcqRecord(await movePipelineStage({
+          pipeline: 'acquisition',
+          recordId: acqRecord.id,
+          expectedStageId: fromStageId,
+          toStageId: stage.id,
+          note,
+          requestId: pendingStageRequestId,
+        }));
+      } catch (error) {
+        setStageMoveError(error instanceof Error ? error.message : 'Unable to move lead.');
+        setMovingStage(false);
+        await loadAcquisitionData();
+        return false;
+      }
     }
     setMovingStage(false);
+    setPendingStageName(null);
+    setPendingStageRequestId(null);
     onUpdated();
+    return true;
   };
 
   const markDead = async () => {
     if (!acqRecord) return;
-    setMovingStage(true);
-    const deadStage = acqStages.find((s) => s.name.toLowerCase().includes('dead'));
+    const deadStage = acqStages.find((s) => s.stage_key === 'dead');
     if (deadStage) {
-      await supabase.from('acquisition_records').update({
-        pipeline_stage_id: deadStage.id,
-        stage_entered_at: new Date().toISOString(),
-        assigned_user_id: user?.id ?? null,
-      }).eq('id', acqRecord.id);
-      setAcqRecord({ ...acqRecord, pipeline_stage_id: deadStage.id });
-      await logActivity({ companyId, actorId: user?.id, entityType: 'acquisition_record', entityId: acqRecord.id, eventType: 'stage_changed', metadata: { stage: 'Dead/DNC' } });
+      setPendingStageName(deadStage.name);
+      setPendingStageRequestId(crypto.randomUUID());
     } else {
-      await supabase.from('acquisition_records').update({
-        archived_at: new Date().toISOString(),
-      }).eq('id', acqRecord.id);
-      setAcqRecord(null);
-      await logActivity({ companyId, actorId: user?.id, entityType: 'acquisition_record', entityId: acqRecord.id, eventType: 'record_archived', metadata: { reason: 'marked_dead' } });
+      setStageMoveError('The Dead stage is not configured for this company.');
     }
-    setMovingStage(false);
-    onUpdated();
   };
 
   if (!contact) return null;
@@ -510,17 +524,18 @@ export function ContactDrawer({
                       )}
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <Button size="sm" variant={acqStages.find((s) => s.id === acqRecord.pipeline_stage_id)?.name === 'No Answer' ? 'default' : 'outline'} className="gap-1.5 h-8 text-xs" disabled={movingStage} onClick={() => moveToStage('No Answer')}>
-                        <PhoneOff className="h-3 w-3" /> No Answer
+                      <Button size="sm" variant={acqStages.find((s) => s.id === acqRecord.pipeline_stage_id)?.stage_key === 'no_answer' ? 'default' : 'outline'} className="gap-1.5 h-8 text-xs" disabled={movingStage} onClick={() => moveToStage('no_answer')}>
+                        <PhoneOff className="h-3 w-3" /> {acqStages.find((s) => s.stage_key === 'no_answer')?.name ?? 'No Answer'}
                       </Button>
-                      <Button size="sm" variant={acqStages.find((s) => s.id === acqRecord.pipeline_stage_id)?.name === 'Answered' ? 'default' : 'outline'} className="gap-1.5 h-8 text-xs" disabled={movingStage} onClick={() => moveToStage('Answered')}>
-                        <CheckCircle2 className="h-3 w-3" /> Answered
+                      <Button size="sm" variant={acqStages.find((s) => s.id === acqRecord.pipeline_stage_id)?.stage_key === 'answered' ? 'default' : 'outline'} className="gap-1.5 h-8 text-xs" disabled={movingStage} onClick={() => moveToStage('answered')}>
+                        <CheckCircle2 className="h-3 w-3" /> {acqStages.find((s) => s.stage_key === 'answered')?.name ?? 'Answered'}
                       </Button>
                       <Button size="sm" variant="outline" className="gap-1.5 h-8 text-xs text-destructive hover:text-destructive border-destructive/30 hover:bg-destructive/10" disabled={movingStage} onClick={markDead}>
                         <XCircle className="h-3 w-3" /> Dead/DNC
                       </Button>
                       {movingStage && <Spinner className="h-4 w-4 animate-spin text-muted-foreground" />}
                     </div>
+                    {stageMoveError && <p role="alert" className="text-xs text-destructive">{stageMoveError}</p>}
                   </div>
 
                   {/* Property - full details */}
@@ -640,7 +655,17 @@ export function ContactDrawer({
                   {/* Notes for this acquisition record */}
                   <div>
                     <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Notes</h4>
-                    <NotesSection entityType="acquisition_record" entityId={acqRecord.id} companyId={companyId} contactId={contactId} />
+                    <NotesSection
+                      entityType="acquisition_record"
+                      entityId={acqRecord.id}
+                      companyId={companyId}
+                      relatedEntities={[
+                        { entityType: 'contact', entityId: contactId, label: 'Contact' },
+                        ...(acqRecord.opportunity_id
+                          ? [{ entityType: 'opportunity', entityId: acqRecord.opportunity_id, label: 'Opportunity' }]
+                          : []),
+                      ]}
+                    />
                   </div>
                 </div>
               ) : (
@@ -677,6 +702,17 @@ export function ContactDrawer({
             companyId={companyId}
             userId={user?.id ?? null}
             onClose={() => setShowTaskDialog(false)}
+          />
+        )}
+        {pendingStageName && acqRecord && (
+          <StageMoveDialog
+            open
+            fromStage={acqStages.find((stage) => stage.id === acqRecord.pipeline_stage_id)?.name ?? 'Unknown stage'}
+            toStage={pendingStageName}
+            saving={movingStage}
+            error={stageMoveError}
+            onCancel={() => { setPendingStageName(null); setPendingStageRequestId(null); }}
+            onConfirm={confirmStageMove}
           />
         )}
       </SheetContent>

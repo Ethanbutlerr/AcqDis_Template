@@ -40,6 +40,9 @@ const NOTIFICATION_ICONS: Record<string, React.ComponentType<{ className?: strin
   needs_contract: FileText,
   contract_executed: CheckCircle2,
   automation_error: Zap,
+  callback_requested: Phone,
+  missed_call: Phone,
+  duplicate_review: AlertCircle,
 };
 
 const NOTIFICATION_COLORS: Record<string, string> = {
@@ -52,6 +55,9 @@ const NOTIFICATION_COLORS: Record<string, string> = {
   needs_contract: 'text-violet-600',
   contract_executed: 'text-green-600',
   automation_error: 'text-red-600',
+  callback_requested: 'text-emerald-600',
+  missed_call: 'text-red-500',
+  duplicate_review: 'text-amber-600',
 };
 
 export function NotificationCenter() {
@@ -106,6 +112,9 @@ export function NotificationCenter() {
       case 'contact': return '/contacts';
       case 'task': return '/tasks';
       case 'opportunity': return '/opportunities';
+      case 'conversation': return '/conversations';
+      case 'opportunity_duplicate_review': return '/acquisitions';
+      case 'call': return '/conversations';
       default: return null;
     }
   };

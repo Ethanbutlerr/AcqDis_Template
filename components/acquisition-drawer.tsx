@@ -3,7 +3,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
-import { formatPhone, formatDate } from '@/lib/utils/format';
+import { updateAcquisitionRecord } from '@/lib/utils/update-acquisition';
+import { triggerAutomation } from '@/lib/utils/automation';
+import { movePipelineStage } from '@/lib/utils/pipeline-stage';
+import { formatPhone, formatDate, fullAddress } from '@/lib/utils/format';
 import { AcquisitionPipelineStage, AcquisitionRecord, Contact, Property } from '@/lib/types';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -14,16 +17,18 @@ import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { NotesSection } from '@/components/notes-section';
-import { Phone, MessageSquare, PhoneCall } from 'lucide-react';
+import { OpportunityContactEditor } from '@/components/opportunity-contact-editor';
+import { MessageSquare } from 'lucide-react';
+import { OpportunityCallButton } from '@/components/opportunity-call-button';
+import { StageMoveDialog } from '@/components/stage-move-dialog';
 
 export function AcquisitionDrawer({
-  recordId, companyId, userId, canEdit, canSimulateCall, stages, onClose, onUpdated,
+  recordId, companyId, userId, canEdit, stages, onClose, onUpdated,
 }: {
   recordId: string;
   companyId: string;
   userId: string | null;
   canEdit: boolean;
-  canSimulateCall: boolean;
   stages: AcquisitionPipelineStage[];
   onClose: () => void;
   onUpdated: () => void;
@@ -33,6 +38,10 @@ export function AcquisitionDrawer({
   const [contact, setContact] = useState<Contact | null>(null);
   const [property, setProperty] = useState<Property | null>(null);
   const [users, setUsers] = useState<{ id: string; full_name: string }[]>([]);
+  const [saveError, setSaveError] = useState('');
+  const [pendingStageId, setPendingStageId] = useState<string | null>(null);
+  const [pendingStageRequestId, setPendingStageRequestId] = useState<string | null>(null);
+  const [stageMoveSaving, setStageMoveSaving] = useState(false);
 
   const load = useCallback(async () => {
     const { data: rec } = await supabase.from('acquisition_records').select('*').eq('id', recordId).maybeSingle();
@@ -66,55 +75,71 @@ export function AcquisitionDrawer({
     onUpdated();
   };
 
+  const saveChanges = async (changes: Record<string, unknown>) => {
+    if (!record || !canEdit) return false;
+    setSaveError('');
+    try {
+      setRecord(await updateAcquisitionRecord(record, companyId, changes));
+      return true;
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Unable to save lead.');
+      await load();
+      onUpdated();
+      return false;
+    }
+  };
+
   const handleStageChange = async (stageId: string) => {
-    if (!record) return;
-    await supabase.from('acquisition_records').update({
-      pipeline_stage_id: stageId,
-      stage_entered_at: new Date().toISOString(),
-    }).eq('id', recordId);
+    if (!record || !canEdit || stageId === record.pipeline_stage_id) return;
+    setPendingStageId(stageId);
+    setPendingStageRequestId(crypto.randomUUID());
+  };
 
-    await supabase.from('acquisition_stage_history').insert({
-      company_id: companyId,
-      acquisition_record_id: recordId,
-      from_stage_id: record.pipeline_stage_id,
-      to_stage_id: stageId,
-      changed_by: userId,
-      is_automated: false,
-      reason: 'manual_drawer',
-    });
-
-    await supabase.from('activity_events').insert({
-      company_id: companyId,
-      actor_id: userId,
-      entity_type: 'acquisition_record',
-      entity_id: recordId,
-      event_type: 'acquisition_stage_changed',
-      metadata: { from_stage_id: record.pipeline_stage_id, to_stage_id: stageId, reason: 'manual_drawer' },
-    });
+  const confirmStageChange = async (note: string) => {
+    if (!record || !record.pipeline_stage_id || !pendingStageId || !pendingStageRequestId) return false;
+    const stageId = pendingStageId;
+    const fromStageId = record.pipeline_stage_id;
+    setStageMoveSaving(true);
+    setSaveError('');
+    try {
+      setRecord(await movePipelineStage<AcquisitionRecord>({
+        pipeline: 'acquisition',
+        recordId,
+        expectedStageId: fromStageId,
+        toStageId: stageId,
+        note,
+        requestId: pendingStageRequestId,
+      }));
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Unable to move lead.');
+      setStageMoveSaving(false);
+      return false;
+    }
 
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/functions/v1/automation-engine`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''}` },
-        body: JSON.stringify({
-          action: 'trigger',
-          trigger_type: 'stage_changed',
-          company_id: companyId,
-          record_id: recordId,
-          record_type: 'acquisition_record',
-          metadata: { from_stage_id: record.pipeline_stage_id, to_stage_id: stageId, changed_by: userId },
-        }),
+      await triggerAutomation({
+        trigger_type: 'stage_changed',
+        company_id: companyId,
+        record_id: recordId,
+        record_type: 'acquisition_record',
+        metadata: { request_id: pendingStageRequestId, from_stage_id: fromStageId, to_stage_id: stageId, changed_by: userId, note },
       });
-    } catch { /* non-blocking */ }
+    } catch (error) {
+      setSaveError((current) => current || (error instanceof Error ? error.message : 'Lead moved, but its follow-up automation could not be started.'));
+    }
 
-    load();
+    setStageMoveSaving(false);
+    setPendingStageId(null);
+    setPendingStageRequestId(null);
+    await load();
     onUpdated();
+    return true;
   };
 
   const handleAssign = async (assigneeId: string | null) => {
-    if (!record) return;
+    if (!record || !canEdit || assigneeId === record.assigned_user_id) return;
     const prevAssignee = record.assigned_user_id;
-    await supabase.from('acquisition_records').update({ assigned_user_id: assigneeId }).eq('id', recordId);
+    if (!await saveChanges({ assigned_user_id: assigneeId })) return;
     await supabase.from('acquisition_assignment_history').insert({
       company_id: companyId,
       acquisition_record_id: recordId,
@@ -132,64 +157,16 @@ export function AcquisitionDrawer({
       metadata: { from_user_id: prevAssignee, to_user_id: assigneeId },
     });
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/functions/v1/automation-engine`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''}` },
-        body: JSON.stringify({
-          action: 'trigger',
-          trigger_type: 'assignment_changed',
-          company_id: companyId,
-          record_id: recordId,
-          record_type: 'acquisition_record',
-          metadata: { from_user_id: prevAssignee, to_user_id: assigneeId, changed_by: userId },
-        }),
+      await triggerAutomation({
+        trigger_type: 'assignment_changed',
+        company_id: companyId,
+        record_id: recordId,
+        record_type: 'acquisition_record',
+        metadata: { from_user_id: prevAssignee, to_user_id: assigneeId, changed_by: userId },
       });
-    } catch { /* non-blocking */ }
-    load();
-    onUpdated();
-  };
-
-  const simulateAnsweredCall = async () => {
-    if (!record || !userId) return;
-    const prevAssignee = record.assigned_user_id;
-    await supabase.from('acquisition_records').update({
-      assigned_user_id: userId,
-      last_contacted_at: new Date().toISOString(),
-    }).eq('id', recordId);
-    await supabase.from('acquisition_assignment_history').insert({
-      company_id: companyId,
-      acquisition_record_id: recordId,
-      from_user_id: prevAssignee,
-      to_user_id: userId,
-      changed_by: userId,
-      reason: 'Answered Call',
-    });
-    await supabase.from('activity_events').insert({
-      company_id: companyId,
-      actor_id: userId,
-      entity_type: 'acquisition_record',
-      entity_id: recordId,
-      event_type: 'acquisition_call_answered',
-      metadata: { assigned_to: userId, simulated: true },
-    });
-    const answeredStage = stages.find((s) => s.name === 'Answered');
-    if (answeredStage && record.pipeline_stage_id !== answeredStage.id) {
-      await handleStageChange(answeredStage.id);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Assignment saved, but its follow-up automation could not be started.');
     }
-    try {
-      await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/functions/v1/automation-engine`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''}` },
-        body: JSON.stringify({
-          action: 'trigger',
-          trigger_type: 'call_answered',
-          company_id: companyId,
-          record_id: recordId,
-          record_type: 'acquisition_record',
-          metadata: { user_id: userId, simulated: true },
-        }),
-      });
-    } catch { /* non-blocking */ }
     load();
     onUpdated();
   };
@@ -217,13 +194,13 @@ export function AcquisitionDrawer({
             {record.lead_source && <span>{record.lead_source}</span>}
           </div>
         </SheetHeader>
+        {saveError && <p role="alert" className="mt-3 text-sm text-destructive">{saveError}</p>}
 
         {/* Action Buttons */}
         <div className="flex items-center gap-2 mt-4 flex-wrap">
           {contact?.primary_phone && (
-            <Button size="sm" variant="outline" className="gap-1.5" onClick={() => router.push(`/conversations?contact_id=${contact.id}&action=call`)}>
-              <Phone className="h-3.5 w-3.5" /> Call
-            </Button>
+            <OpportunityCallButton key={`${recordId}:${contact.id}`} contactId={contact.id} companyId={companyId}
+              userId={userId} acquisitionId={recordId} opportunityId={record.opportunity_id ?? null} />
           )}
           {contact?.primary_phone && (
             <Button size="sm" variant="outline" className="gap-1.5" onClick={() => router.push(`/conversations?contact_id=${contact.id}`)}>
@@ -235,21 +212,45 @@ export function AcquisitionDrawer({
               <MessageSquare className="h-3.5 w-3.5" /> Conversation
             </Button>
           )}
-          {canSimulateCall && (
-            <Button size="sm" variant="default" className="gap-1.5" onClick={simulateAnsweredCall}>
-              <PhoneCall className="h-3.5 w-3.5" /> Simulate Answered Call
-            </Button>
-          )}
         </div>
 
         <Tabs defaultValue="details" className="mt-4">
           <TabsList className="grid grid-cols-2 w-full">
-            <TabsTrigger value="details">Lead Details</TabsTrigger>
+            <TabsTrigger value="details">Opportunity Details</TabsTrigger>
             <TabsTrigger value="notes">Notes</TabsTrigger>
           </TabsList>
 
-          {/* Lead Details Tab */}
+          {/* Opportunity Details Tab */}
           <TabsContent value="details" className="space-y-6 mt-4">
+            {/* Contact Information */}
+            <div className="rounded-lg border p-4 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Contact Information</h4>
+                {contact && <OpportunityContactEditor key={contact.id} contact={contact} companyId={companyId} onSaved={(updated) => {
+                  setContact((current) => current?.id === updated.id ? updated : current);
+                  onUpdated();
+                }} />}
+              </div>
+              <div className="grid gap-y-3 gap-x-6 sm:grid-cols-2 text-sm">
+                <div>
+                  <span className="text-xs text-muted-foreground block">Name</span>
+                  <span className="font-medium">{contactName}</span>
+                </div>
+                <div>
+                  <span className="text-xs text-muted-foreground block">Phone</span>
+                  <span className="font-medium">{contact?.primary_phone ? formatPhone(contact.primary_phone) : '—'}</span>
+                </div>
+                <div>
+                  <span className="text-xs text-muted-foreground block">Email</span>
+                  <span>{contact?.primary_email ?? '—'}</span>
+                </div>
+                <div>
+                  <span className="text-xs text-muted-foreground block">Lead Generated</span>
+                  <span>{formatDate(contact?.lead_generated_at ?? record.created_at)}</span>
+                </div>
+              </div>
+            </div>
+
             {/* Stage & Assignment */}
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">
@@ -283,36 +284,13 @@ export function AcquisitionDrawer({
               </div>
             </div>
 
-            {/* All Lead Fields - matches spreadsheet columns */}
-            <div className="rounded-lg border p-4 space-y-4">
-              <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Seller Lead Details</h4>
-              <div className="grid gap-y-3 gap-x-6 sm:grid-cols-2 text-sm">
-                <div>
-                  <span className="text-xs text-muted-foreground block">Name</span>
-                  <span className="font-medium">{contactName}</span>
-                </div>
-                <div>
-                  <span className="text-xs text-muted-foreground block">Phone</span>
-                  <span className="font-medium">{contact?.primary_phone ? formatPhone(contact.primary_phone) : '—'}</span>
-                </div>
-                <div>
-                  <span className="text-xs text-muted-foreground block">Email</span>
-                  <span>{contact?.primary_email ?? '—'}</span>
-                </div>
-                <div>
-                  <span className="text-xs text-muted-foreground block">Lead Generated</span>
-                  <span>{formatDate(contact?.lead_generated_at ?? record.created_at)}</span>
-                </div>
-              </div>
-            </div>
-
             {/* Property Address */}
             <div className="rounded-lg border p-4 space-y-4">
               <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Property</h4>
               <div className="grid gap-y-3 gap-x-6 sm:grid-cols-2 text-sm">
                 <div className="sm:col-span-2">
                   <span className="text-xs text-muted-foreground block">Property Address</span>
-                  <span className="font-medium">{property ? [property.street_address, property.city, property.state, property.zip_code].filter(Boolean).join(', ') : '—'}</span>
+                  <span className="font-medium">{property ? fullAddress(property) || '—' : '—'}</span>
                 </div>
                 <div>
                   <span className="text-xs text-muted-foreground block">Property Type</span>
@@ -442,6 +420,15 @@ export function AcquisitionDrawer({
               </div>
             </div>
 
+            {/* Contract Information */}
+            <div className="rounded-lg border p-4 space-y-4">
+              <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Contract Information</h4>
+              <div className="text-sm">
+                <span className="text-xs text-muted-foreground block">Contract Executed</span>
+                <span>{formatDate(record.contract_executed_at)}</span>
+              </div>
+            </div>
+
             {/* Timestamps */}
             <div className="text-xs text-muted-foreground space-y-1 pt-2 border-t">
               {record.last_contacted_at && <p>Last Contacted: {formatDate(record.last_contacted_at)}</p>}
@@ -452,9 +439,28 @@ export function AcquisitionDrawer({
 
           {/* Notes Tab */}
           <TabsContent value="notes" className="mt-4">
-            <NotesSection entityType="acquisition_record" entityId={recordId} companyId={companyId} contactId={record?.contact_id ?? undefined} />
+            <NotesSection
+              entityType="acquisition_record"
+              entityId={recordId}
+              companyId={companyId}
+              relatedEntities={[
+                ...(record.opportunity_id ? [{ entityType: 'opportunity', entityId: record.opportunity_id, label: 'Opportunity' }] : []),
+                ...(record.contact_id ? [{ entityType: 'contact', entityId: record.contact_id, label: 'Contact' }] : []),
+              ]}
+            />
           </TabsContent>
         </Tabs>
+        {pendingStageId && currentStage && (
+          <StageMoveDialog
+            open
+            fromStage={currentStage.name}
+            toStage={stages.find((stage) => stage.id === pendingStageId)?.name ?? 'Selected stage'}
+            saving={stageMoveSaving}
+            error={saveError}
+            onCancel={() => { setPendingStageId(null); setPendingStageRequestId(null); }}
+            onConfirm={confirmStageChange}
+          />
+        )}
       </SheetContent>
     </Sheet>
   );
