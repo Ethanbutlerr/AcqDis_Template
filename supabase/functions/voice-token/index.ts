@@ -169,10 +169,24 @@ async function validateTwilioWebhook(
   // Supabase may expose the public project URL through a proxy. Twilio signs the
   // public URL it called, so validate both the runtime URL and its canonical form.
   candidateUrls.add(`${SUPABASE_URL.replace(/\/$/, "")}${requestUrl.pathname}${requestUrl.search}`);
+  const projectRef = new URL(SUPABASE_URL).hostname.split(".")[0];
+  if (projectRef) {
+    candidateUrls.add(`https://${projectRef}.functions.supabase.co/voice-token${requestUrl.search}`);
+  }
   const forwardedHost = (req.headers.get("x-forwarded-host") ?? "").split(",")[0].trim();
   const forwardedProto = (req.headers.get("x-forwarded-proto") ?? "https").split(",")[0].trim();
   if (forwardedHost) {
     candidateUrls.add(`${forwardedProto}://${forwardedHost}${requestUrl.pathname}${requestUrl.search}`);
+  }
+
+  // A trailing slash changes Twilio's signature even though the function route is
+  // equivalent, so validate both forms for every public URL candidate.
+  for (const url of Array.from(candidateUrls)) {
+    const parsed = new URL(url);
+    parsed.pathname = parsed.pathname.endsWith("/")
+      ? parsed.pathname.slice(0, -1)
+      : `${parsed.pathname}/`;
+    candidateUrls.add(parsed.toString());
   }
 
   const webhookAccountSid = params.AccountSid ?? "";
@@ -197,6 +211,23 @@ async function validateTwilioWebhook(
       }
     });
   });
+}
+
+async function ensureTwimlAppVoiceUrl(
+  accountSid: string,
+  authToken: string,
+  twimlAppSid: string,
+): Promise<void> {
+  const voiceUrl = Deno.env.get("TWILIO_VOICE_WEBHOOK_URL")
+    || `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/voice-token`;
+  const client = twilio(accountSid, authToken);
+  const application = await client.applications(twimlAppSid).fetch();
+  if (application.voiceUrl !== voiceUrl || application.voiceMethod !== "POST") {
+    await client.applications(twimlAppSid).update({
+      voiceUrl,
+      voiceMethod: "POST",
+    });
+  }
 }
 
 function logTwilioRejection(
@@ -596,6 +627,20 @@ Deno.serve(async (req: Request) => {
         return new Response(
           JSON.stringify({ error: "Twilio API Key SID and Secret are required for browser calling. Add api_key_sid and api_key_secret to your Twilio integration settings." }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      try {
+        await ensureTwimlAppVoiceUrl(accountSid, authToken, twimlAppSid);
+      } catch (error) {
+        console.error("Twilio TwiML App configuration error", {
+          message: error instanceof Error ? error.message : "Unknown Twilio error",
+        });
+        return new Response(
+          JSON.stringify({
+            error: "Twilio calling could not be configured. Confirm that the Account SID, Auth Token, and TwiML App SID belong to the same Twilio account.",
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
 
