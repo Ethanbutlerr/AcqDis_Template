@@ -130,7 +130,7 @@ function voiceIdentity(userId: string): string {
 async function getInboundRecipients(supabase: any, companyId: string, phoneNumber: any): Promise<string[]> {
   const [{ data: profiles }, { data: permission }] = await Promise.all([
     supabase.from("profiles").select("id, is_agency_admin").eq("company_id", companyId).eq("is_disabled", false),
-    supabase.from("permissions").select("id").eq("key", "view_calls").maybeSingle(),
+    supabase.from("permissions").select("id").eq("key", "receive_calls").maybeSingle(),
   ]);
 
   const profileIds = new Set((profiles ?? []).map((profile: { id: string }) => profile.id));
@@ -546,7 +546,7 @@ Deno.serve(async (req: Request) => {
     const requiredPermission = ["sync_numbers", "configure_inbound"].includes(action)
       ? "manage_phone_numbers"
       : action === "get_token"
-        ? ["view_calls", "view_acquisitions", "view_dispositions"]
+        ? ["make_calls", "receive_calls"]
         : "view_calls";
     const authorizedUser = await authorizeUserRequest(req, supabase, company_id, user_id, requiredPermission);
     if (!authorizedUser) {
@@ -587,14 +587,18 @@ Deno.serve(async (req: Request) => {
         );
       }
 
+      const [canMakeCalls, canReceiveCalls] = await Promise.all([
+        authorizeUserRequest(req, supabase, company_id, user_id, "make_calls"),
+        authorizeUserRequest(req, supabase, company_id, user_id, "receive_calls"),
+      ]);
       const { AccessToken } = twilio.jwt;
       const { VoiceGrant } = AccessToken;
 
       const identity = voiceIdentity(authorizedUser.id);
       const token = new AccessToken(accountSid, apiKeySid, apiKeySecret, { identity });
       const voiceGrant = new VoiceGrant({
-        outgoingApplicationSid: twimlAppSid,
-        incomingAllow: true,
+        ...(canMakeCalls ? { outgoingApplicationSid: twimlAppSid } : {}),
+        incomingAllow: !!canReceiveCalls,
       });
       token.addGrant(voiceGrant);
 

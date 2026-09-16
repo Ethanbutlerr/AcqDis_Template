@@ -47,7 +47,7 @@ const FETCH_PAGE_SIZE = 1000;
 export default function AcquisitionsPage() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
-  const canEdit = hasPermission('edit_acquisitions') || hasPermission('edit_acquisition_records');
+  const canEdit = hasPermission('edit_acquisitions');
   const canViewAllLeads = !!profile?.is_agency_admin || hasPermission('view_all_acquisition_leads');
   const companyId = profile?.company_id ?? null;
 

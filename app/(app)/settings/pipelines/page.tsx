@@ -34,8 +34,8 @@ export default function PipelineSettingsPage() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
   const companyId = profile?.company_id ?? null;
-  const canEditAcquisition = !!profile?.is_agency_admin || hasPermission('edit_acquisitions');
-  const canEditDisposition = !!profile?.is_agency_admin || hasPermission('edit_dispositions');
+  const canEditAcquisition = hasPermission('manage_pipeline_stages') && hasPermission('edit_acquisitions');
+  const canEditDisposition = hasPermission('manage_pipeline_stages') && hasPermission('edit_dispositions');
   const [pipeline, setPipeline] = useState<Pipeline>(canEditAcquisition ? 'acquisition' : 'disposition');
   const [stages, setStages] = useState<Record<Pipeline, StageRow[]>>({ acquisition: [], disposition: [] });
   const [loading, setLoading] = useState(true);

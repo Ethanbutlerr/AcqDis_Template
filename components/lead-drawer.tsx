@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '@/lib/supabase/client';
+import { usePermissions } from '@/lib/auth/use-permissions';
 import { formatPhone, formatDate, formatRelativeTime, formatCurrency, fullAddress } from '@/lib/utils/format';
 import { changeLeadStage, stopCampaignSequence, createAcquisitionHandoff } from '@/lib/utils/lead-pipeline';
 import { logActivity } from '@/lib/utils/activity';
@@ -49,6 +50,7 @@ export function LeadDrawer({
   onClose: () => void;
   onUpdated: () => void;
 }) {
+  const { hasPermission } = usePermissions();
   const [lead, setLead] = useState<LeadRecord | null>(null);
   const [contact, setContact] = useState<Contact | null>(null);
   const [property, setProperty] = useState<Property | null>(null);
@@ -349,7 +351,7 @@ export function LeadDrawer({
             </div>
 
             <div className="flex gap-2">
-              {canEdit && (
+              {canEdit && hasPermission(lead.archived_at ? 'restore_deleted_records' : 'delete_records') && (
                 <Button variant="outline" size="sm" onClick={() => handleArchive(!lead.archived_at)} className="gap-1.5">
                   {lead.archived_at ? <><RotateCcw className="h-3.5 w-3.5" /> Restore</> : <><Archive className="h-3.5 w-3.5" /> Archive</>}
                 </Button>

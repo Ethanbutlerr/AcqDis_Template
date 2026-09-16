@@ -97,6 +97,19 @@ Deno.serve(async (req: Request) => {
     const body = await req.json();
     const { action } = body;
 
+    // Test events are developer tools, never ordinary CRM permissions.
+    if (typeof action === "string" && action.startsWith("simulate_")) {
+      const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      if (!token) return jsonResponse({ error: "Authentication required" }, 401);
+      const { data: { user } } = await supabase.auth.getUser(token);
+      if (!user) return jsonResponse({ error: "Authentication required" }, 401);
+      const { data: profile } = await supabase.from("profiles")
+        .select("company_id, is_agency_admin, is_disabled").eq("id", user.id).maybeSingle();
+      if (!profile?.is_agency_admin || profile.is_disabled || profile.company_id !== body.company_id) {
+        return jsonResponse({ error: "Developer access required" }, 403);
+      }
+    }
+
     switch (action) {
       case "send_sms":         return await sendSms(supabase, body);
       case "simulate_inbound": return await simulateInboundSms(supabase, body);

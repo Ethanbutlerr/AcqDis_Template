@@ -16,7 +16,7 @@ type IncomingStatus = 'ringing' | 'connecting' | 'connected' | 'ended';
 export function IncomingCallListener() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
-  const canReceiveCalls = hasPermission('view_calls');
+  const canReceiveCalls = hasPermission('receive_calls');
   const [deviceStatus, setDeviceStatus] = useState<DeviceStatus>('checking');
   const [incomingStatus, setIncomingStatus] = useState<IncomingStatus>('ringing');
   const [incomingCall, setIncomingCall] = useState<Call | null>(null);

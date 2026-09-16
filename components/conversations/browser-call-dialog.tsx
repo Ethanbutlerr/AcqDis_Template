@@ -24,7 +24,8 @@ interface BrowserCallDialogProps {
 }
 
 export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhone, companyId, conversationId, contactId, acquisitionId, opportunityId }: BrowserCallDialogProps) {
-  const { profile } = useAuth();
+  const { profile, permissions } = useAuth();
+  const canCall = !!profile?.is_agency_admin || permissions.includes('make_calls');
   const [status, setStatus] = useState<CallStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -99,6 +100,7 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
   }, [companyId, conversationId, contactId, contactPhone, profile?.id, acquisitionId, opportunityId]);
 
   const startCall = useCallback(async () => {
+    if (!canCall) { setError('Your role does not allow making calls.'); return; }
     if (startingRef.current) return;
     startingRef.current = true;
     const attempt = ++attemptRef.current;
@@ -217,7 +219,7 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
     } finally {
       if (attempt === attemptRef.current) startingRef.current = false;
     }
-  }, [companyId, contactPhone, profile?.id, onOpenChange, logCallToHistory]);
+  }, [canCall, companyId, contactPhone, profile?.id, onOpenChange, logCallToHistory]);
 
   const endCall = useCallback(() => {
     attemptRef.current += 1;
@@ -311,12 +313,12 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
 
           <div className="flex items-center gap-3 mt-2">
             {(status === 'idle' || status === 'failed') && (
-              <Button onClick={startCall} className="gap-2 bg-emerald-600 hover:bg-emerald-700">
+              <Button disabled={!canCall} onClick={startCall} className="gap-2 bg-emerald-600 hover:bg-emerald-700">
                 <Phone className="h-4 w-4" /> Call Now
               </Button>
             )}
             {status === 'number_busy' && (
-              <Button onClick={startCall} variant="outline" className="gap-2">
+              <Button disabled={!canCall} onClick={startCall} variant="outline" className="gap-2">
                 <Phone className="h-4 w-4" /> Try Again
               </Button>
             )}

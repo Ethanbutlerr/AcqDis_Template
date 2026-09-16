@@ -199,7 +199,7 @@ export default function ContactsPage() {
   };
 
   const mergeContacts = async (group: Contact[]) => {
-    if (!companyId || group.length < 2) return;
+    if (!companyId || group.length < 2 || !hasPermission('delete_records')) return;
     const primary = group[0];
     const duplicates = group.slice(1);
 
@@ -265,7 +265,7 @@ export default function ContactsPage() {
                 <Upload className="h-4 w-4" />
                 <span className="hidden sm:inline">Import</span>
               </Button>
-              <Button variant="outline" size="sm" className="gap-1.5" onClick={detectDuplicates}>
+              <Button variant="outline" size="sm" className="gap-1.5" disabled={!hasPermission('delete_records')} onClick={detectDuplicates}>
                 <GitMerge className="h-4 w-4" />
                 <span className="hidden sm:inline">Duplicates</span>
               </Button>

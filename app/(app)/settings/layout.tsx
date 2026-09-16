@@ -21,7 +21,7 @@ const settingsNav: { href: string; label: string; icon: typeof Building2; permis
   { href: '/settings/users', label: 'Users', icon: Users, permission: 'manage_users' },
   { href: '/settings/teams', label: 'Teams', icon: Network, permission: 'manage_teams' },
   { href: '/settings/roles', label: 'Roles', icon: Shield, permission: 'manage_roles' },
-  { href: '/settings/pipelines', label: 'Pipelines', icon: Columns3, anyPermission: ['edit_acquisitions', 'edit_dispositions'] },
+  { href: '/settings/pipelines', label: 'Pipelines', icon: Columns3, permission: 'manage_pipeline_stages', anyPermission: ['edit_acquisitions', 'edit_dispositions'] },
   { href: '/settings/custom-fields', label: 'Custom Fields', icon: ListPlus, permission: 'manage_custom_fields' },
   { href: '/settings/phone-numbers', label: 'Phone Numbers', icon: Phone, permission: 'manage_phone_numbers' },
   { href: '/settings/integrations', label: 'Integrations', icon: Plug, permission: 'manage_branding' },

@@ -407,7 +407,7 @@ export default function SellersPage() {
                                 </button>
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end">
-                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); supabase.from('lead_records').update({ archived_at: lead.archived_at ? null : new Date().toISOString() }).eq('id', lead.id).then(() => load()); }}>
+                                <DropdownMenuItem disabled={!hasPermission(lead.archived_at ? 'restore_deleted_records' : 'delete_records')} onClick={(e) => { e.stopPropagation(); supabase.from('lead_records').update({ archived_at: lead.archived_at ? null : new Date().toISOString() }).eq('id', lead.id).then(() => load()); }}>
                                   {lead.archived_at ? <RotateCcw className="mr-2 h-3.5 w-3.5" /> : <Archive className="mr-2 h-3.5 w-3.5" />}
                                   {lead.archived_at ? 'Restore' : 'Archive'}
                                 </DropdownMenuItem>

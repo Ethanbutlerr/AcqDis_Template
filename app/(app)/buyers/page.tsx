@@ -360,7 +360,7 @@ export default function BuyersPage() {
                                 </button>
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end">
-                                <DropdownMenuItem onClick={(e) => {
+                                <DropdownMenuItem disabled={!hasPermission(lead.archived_at ? 'restore_deleted_records' : 'delete_records')} onClick={(e) => {
                                   e.stopPropagation();
                                   supabase.from('lead_records').update({ archived_at: lead.archived_at ? null : new Date().toISOString() }).eq('id', lead.id).then(() => load());
                                 }}>

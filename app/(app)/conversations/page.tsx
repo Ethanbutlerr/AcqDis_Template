@@ -45,7 +45,7 @@ export default function ConversationsPage() {
   const loadTimelineRef = useRef<((id: string, isInitial?: boolean) => Promise<void>) | null>(null);
 
   const canSend = hasPermission('send_individual_sms') || hasPermission('send_individual_email');
-  const canSimulate = hasPermission('view_developer_changelog');
+  const canSimulate = !!profile?.is_agency_admin;
 
   const loadConversations = useCallback(async () => {
     if (!companyId) return;

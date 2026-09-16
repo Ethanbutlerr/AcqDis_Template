@@ -38,7 +38,7 @@ export default function DispositionsPage() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
   const canEdit = hasPermission('edit_dispositions');
-  const canCreateAcquisition = hasPermission('edit_acquisitions') || hasPermission('edit_acquisition_records');
+  const canCreateAcquisition = hasPermission('edit_acquisitions');
   const canViewAllDeals = !!profile?.is_agency_admin || hasPermission('view_all_disposition_deals');
   const companyId = profile?.company_id ?? null;
 

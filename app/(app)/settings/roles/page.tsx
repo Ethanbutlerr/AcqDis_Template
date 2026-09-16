@@ -30,6 +30,7 @@ import {
 import { supabase } from '@/lib/supabase/client';
 import { Loader2, Plus, Shield, Pencil, AlertCircle, Lock, Trash2, KeyRound } from 'lucide-react';
 import type { Role, Permission } from '@/lib/types';
+import { visiblePermissions, canonicalPermissionIds } from '@/lib/auth/permission-catalog';
 
 function extractErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -53,7 +54,7 @@ export default function RolesSettingsPage() {
 }
 
 function RolesSettings() {
-  const { profile } = useAuth();
+  const { profile, refreshProfile } = useAuth();
   const [roles, setRoles] = useState<RoleWithPermissions[]>([]);
   const [allPermissions, setAllPermissions] = useState<Permission[]>([]);
   const [loading, setLoading] = useState(true);
@@ -94,28 +95,37 @@ function RolesSettings() {
       }
       setAllPermissions(permsData ?? []);
 
-      const rolesWithPerms = await Promise.all(
-        (rolesData ?? []).map(async (role) => {
-          const { data: rpData } = await supabase
-            .from('role_permissions')
-            .select('permission_id')
-            .eq('role_id', role.id);
-
-          const permIds = new Set((rpData ?? []).map((rp) => rp.permission_id));
-          const perms = (permsData ?? []).filter((p) => permIds.has(p.id));
-
-          const { count } = await supabase
-            .from('user_roles')
-            .select('*', { count: 'exact', head: true })
-            .eq('role_id', role.id);
-
-          return {
-            ...role,
-            permissions: perms,
-            user_count: count ?? 0,
-          };
-        }),
-      );
+      const roleIds = (rolesData ?? []).map(role => role.id);
+      if (roleIds.length === 0) { setRoles([]); return; }
+      const readAssignments = async () => {
+        const rows: { role_id: string; permission_id: string }[] = [];
+        for (let offset = 0; ; offset += 500) {
+          const { data, error } = await supabase.from('role_permissions').select('role_id, permission_id')
+            .in('role_id', roleIds).order('role_id').order('permission_id').range(offset, offset + 499);
+          if (error) throw error;
+          rows.push(...(data ?? []));
+          if ((data?.length ?? 0) < 500) return rows;
+        }
+      };
+      const readMemberships = async () => {
+        const rows: { role_id: string; user_id: string }[] = [];
+        for (let offset = 0; ; offset += 500) {
+          const { data, error } = await supabase.from('user_roles').select('role_id, user_id')
+            .in('role_id', roleIds).order('role_id').order('user_id').range(offset, offset + 499);
+          if (error) throw error;
+          rows.push(...(data ?? []));
+          if ((data?.length ?? 0) < 500) return rows;
+        }
+      };
+      const [assignments, memberships] = await Promise.all([readAssignments(), readMemberships()]);
+      const rolesWithPerms = (rolesData ?? []).map(role => {
+        const permIds = new Set(assignments.filter(row => row.role_id === role.id).map(row => row.permission_id));
+        return {
+          ...role,
+          permissions: (permsData ?? []).filter(p => permIds.has(p.id)),
+          user_count: memberships.filter(row => row.role_id === role.id).length,
+        };
+      });
 
       setRoles(rolesWithPerms);
     } catch (err: unknown) {
@@ -129,7 +139,7 @@ function RolesSettings() {
     loadRoles();
   }, [loadRoles]);
 
-  const groupedPerms = allPermissions.reduce((acc, perm) => {
+  const groupedPerms = visiblePermissions(allPermissions).reduce((acc, perm) => {
     if (!acc[perm.category]) acc[perm.category] = [];
     acc[perm.category].push(perm);
     return acc;
@@ -142,37 +152,14 @@ function RolesSettings() {
     setError(null);
 
     try {
-      let roleId = editRole?.id;
-
-      if (editRole) {
-        const { error: updateError } = await supabase
-          .from('roles')
-          .update({ name: roleName, description: roleDescription || null })
-          .eq('id', editRole.id);
-        if (updateError) throw updateError;
-
-        await supabase.from('role_permissions').delete().eq('role_id', editRole.id);
-      } else {
-        const { data: newRole, error: insertError } = await supabase
-          .from('roles')
-          .insert({
-            company_id: profile.company_id,
-            name: roleName,
-            description: roleDescription || null,
-          })
-          .select()
-          .single();
-        if (insertError) throw insertError;
-        roleId = newRole.id;
-      }
-
-      const permIds = Array.from(selectedPerms);
-      if (permIds.length > 0 && roleId) {
-        const { error: rpError } = await supabase
-          .from('role_permissions')
-          .insert(permIds.map((pid) => ({ role_id: roleId!, permission_id: pid })));
-        if (rpError) throw rpError;
-      }
+      const { error: saveError } = await supabase.rpc('save_role_permissions', {
+        p_role_id: editRole?.id ?? null,
+        p_name: roleName,
+        p_description: roleDescription || null,
+        p_permission_ids: Array.from(selectedPerms),
+      });
+      if (saveError) throw saveError;
+      await refreshProfile();
 
       setDialogOpen(false);
       setEditRole(null);
@@ -217,7 +204,7 @@ function RolesSettings() {
     setEditRole(role);
     setRoleName(role.name);
     setRoleDescription(role.description ?? '');
-    setSelectedPerms(new Set(role.permissions.map((p) => p.id)));
+    setSelectedPerms(new Set(canonicalPermissionIds(role.permissions, allPermissions)));
     setDialogOpen(true);
   };
 
@@ -271,14 +258,13 @@ function RolesSettings() {
               </DialogHeader>
               <div className="space-y-4">
                 {Object.entries(groupedPerms).map(([category, perms]) => (
-                  <div key={category} className="space-y-1.5">
-                    <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">{category}</p>
+                  <details key={category} className="space-y-1.5 rounded-md border border-border p-2">
+                    <summary className="cursor-pointer text-sm font-medium">{category} ({perms.length})</summary>
                     {perms.map((perm) => (
                       <div key={perm.id} className="flex items-start justify-between gap-4 py-1 border-b border-border last:border-0">
                         <div>
                           <div className="flex items-center gap-2">
                             <span className="text-sm font-medium">{perm.name}</span>
-                            <Badge variant="outline" className="text-xs font-mono">{perm.key}</Badge>
                           </div>
                           {perm.description && (
                             <p className="text-xs text-muted-foreground mt-0.5">{perm.description}</p>
@@ -286,7 +272,7 @@ function RolesSettings() {
                         </div>
                       </div>
                     ))}
-                  </div>
+                  </details>
                 ))}
               </div>
             </DialogContent>
@@ -319,8 +305,8 @@ function RolesSettings() {
                   <Label>Permissions</Label>
                   <div className="space-y-3 max-h-60 overflow-y-auto rounded-md border border-border p-3">
                     {Object.entries(groupedPerms).map(([category, perms]) => (
-                      <div key={category} className="space-y-1.5">
-                        <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">{category}</p>
+                      <details key={category} className="space-y-1.5 rounded-md border border-border p-2">
+                        <summary className="cursor-pointer text-sm font-medium">{category} ({perms.length})</summary>
                         {perms.map((perm) => (
                           <label key={perm.id} className="flex items-center gap-2 cursor-pointer">
                             <input
@@ -337,7 +323,7 @@ function RolesSettings() {
                             </div>
                           </label>
                         ))}
-                      </div>
+                      </details>
                     ))}
                   </div>
                 </div>
@@ -395,7 +381,7 @@ function RolesSettings() {
                   <p className="text-xs text-muted-foreground mb-2">{role.description}</p>
                 )}
                 <div className="flex flex-wrap gap-1">
-                  {role.permissions.map((perm) => (
+                  {visiblePermissions(allPermissions.filter(p => canonicalPermissionIds(role.permissions, allPermissions).includes(p.id))).map((perm) => (
                     <Badge key={perm.id} variant="outline" className="text-xs">{perm.name}</Badge>
                   ))}
                 </div>
