@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { supabase } from '@/lib/supabase/client';
 import { triggerAutomation } from '@/lib/utils/automation';
 import { createPipelineOpportunity, movePipelineStage } from '@/lib/utils/pipeline-stage';
@@ -243,7 +243,7 @@ export default function AcquisitionsPage() {
     return () => loadController.current?.abort();
   }, [load]);
 
-  const filteredRecords = records.filter((r) => {
+  const filteredRecords = useMemo(() => records.filter((r) => {
     if (filterStage !== 'all' && r.pipeline_stage_id !== filterStage) return false;
     if (filterAssigned === 'unassigned' && r.assigned_user_id) return false;
     if (filterAssigned === 'mine' && r.assigned_user_id !== profile?.id) return false;
@@ -264,9 +264,9 @@ export default function AcquisitionsPage() {
       if (!name.includes(lower) && !addr.includes(lower) && !city.includes(lower) && !state.includes(lower) && !(r.motivation ?? '').toLowerCase().includes(lower) && !phoneMatch) return false;
     }
     return true;
-  });
+  }), [records, filterStage, filterAssigned, filterLeadSource, filterMotivation, profile?.id, search, contactsMap, propertiesMap]);
 
-  const sortedRecords = [...filteredRecords].sort((a, b) => {
+  const sortedRecords = useMemo(() => [...filteredRecords].sort((a, b) => {
     let cmp = 0;
     switch (sortField) {
       case 'seller_name': {
@@ -300,9 +300,20 @@ export default function AcquisitionsPage() {
       }
     }
     return sortDir === 'asc' ? cmp : -cmp;
-  });
+  }), [filteredRecords, sortField, sortDir, contactsMap, propertiesMap, opportunitiesMap]);
 
-  const recordsByStage = (stageId: string) => sortedRecords.filter((r) => r.pipeline_stage_id === stageId);
+  const groupedRecords = useMemo(() => {
+    const groups = new Map<string, AcquisitionRecord[]>();
+    for (const record of sortedRecords) {
+      const key = record.pipeline_stage_id;
+      if (!key) continue;
+      const group = groups.get(key);
+      if (group) group.push(record);
+      else groups.set(key, [record]);
+    }
+    return groups;
+  }, [sortedRecords]);
+  const recordsByStage = (stageId: string) => groupedRecords.get(stageId) ?? [];
 
   const handleDragStart = (e: React.DragEvent, recordId: string) => {
     e.dataTransfer.setData('text/plain', recordId);
@@ -490,36 +501,24 @@ export default function AcquisitionsPage() {
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name, address, phone..." className="pl-9 h-9" />
         </div>
-        <Select value={filterStage} onValueChange={setFilterStage}>
-          <SelectTrigger className="w-[140px] h-9"><SelectValue placeholder="All stages" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All stages</SelectItem>
-            {stages.map((s) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
-          </SelectContent>
-        </Select>
-        <Select value={filterAssigned} onValueChange={setFilterAssigned}>
-          <SelectTrigger className="w-[140px] h-9"><SelectValue placeholder="Assignment" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All assignments</SelectItem>
-            <SelectItem value="mine">Assigned to me</SelectItem>
-            <SelectItem value="unassigned">Unassigned</SelectItem>
-            {users.map((u) => <SelectItem key={u.id} value={u.id}>{u.full_name}</SelectItem>)}
-          </SelectContent>
-        </Select>
-        <Select value={filterLeadSource} onValueChange={setFilterLeadSource}>
-          <SelectTrigger className="w-[140px] h-9"><SelectValue placeholder="Lead source" /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All sources</SelectItem>
-            {leadSources.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
-          </SelectContent>
-        </Select>
-        <Select value={filterMotivation} onValueChange={setFilterMotivation}>
-          <SelectTrigger className="w-[160px] h-9"><SelectValue placeholder="Motivation" /></SelectTrigger>
-          <SelectContent className="max-h-64">
-            <SelectItem value="all">All motivations</SelectItem>
-            {motivationTypes.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
-          </SelectContent>
-        </Select>
+        <select aria-label="Stage" value={filterStage} onChange={(event) => setFilterStage(event.target.value)} className="h-9 w-[140px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
+          <option value="all">All stages</option>
+          {stages.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+        </select>
+        <select aria-label="Assignment" value={filterAssigned} onChange={(event) => setFilterAssigned(event.target.value)} className="h-9 w-[160px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
+          <option value="all">All assignments</option>
+          <option value="mine">Assigned to me</option>
+          <option value="unassigned">Unassigned</option>
+          {users.map((u) => <option key={u.id} value={u.id}>{u.full_name}</option>)}
+        </select>
+        <select aria-label="Lead source" value={filterLeadSource} onChange={(event) => setFilterLeadSource(event.target.value)} className="h-9 w-[140px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
+          <option value="all">All sources</option>
+          {leadSources.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select aria-label="Motivation" value={filterMotivation} onChange={(event) => setFilterMotivation(event.target.value)} className="h-9 w-[160px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
+          <option value="all">All motivations</option>
+          {motivationTypes.map((m) => <option key={m} value={m}>{m}</option>)}
+        </select>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="outline" size="sm" className="h-9 gap-1.5">
