@@ -5,13 +5,13 @@ import { Phone } from 'lucide-react';
 import { supabase } from '@/lib/supabase/client';
 import { normalizePhone } from '@/lib/utils/format';
 import { Button } from '@/components/ui/button';
-import { BrowserCallDialog } from '@/components/conversations/browser-call-dialog';
+import { useOutboundCall } from '@/components/conversations/outbound-call-context';
 
 export function OpportunityCallButton({ contactId, companyId, userId, acquisitionId, opportunityId }: {
   contactId: string; companyId: string; userId: string | null;
   acquisitionId: string; opportunityId: string | null;
 }) {
-  const [target, setTarget] = useState<{ name: string; phone: string; conversationId: string } | null>(null);
+  const { openCall } = useOutboundCall();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const generation = useRef(0);
@@ -49,7 +49,8 @@ export function OpportunityCallButton({ contactId, companyId, userId, acquisitio
         if (createError || !created) throw new Error('Unable to prepare call history. Please retry.');
         conversationId = created.id;
       }
-      setTarget({ name: [contact.first_name, contact.last_name].filter(Boolean).join(' ') || contact.company_name || 'Unknown', phone, conversationId });
+      openCall({ contactName: [contact.first_name, contact.last_name].filter(Boolean).join(' ') || contact.company_name || 'Unknown',
+        contactPhone: phone, conversationId, companyId, contactId, acquisitionId, opportunityId });
     } catch (err) {
       if (request === generation.current) setError(err instanceof Error ? err.message : 'Unable to prepare the call.');
     } finally {
@@ -62,9 +63,6 @@ export function OpportunityCallButton({ contactId, companyId, userId, acquisitio
       <Phone className="h-3.5 w-3.5" /> {loading ? 'Preparing…' : 'Call'}
     </Button>
     {error && <p role="alert" className="text-xs text-destructive w-full">{error}</p>}
-    {target && <BrowserCallDialog open onOpenChange={(open) => { if (!open) setTarget(null); }}
-      contactName={target.name} contactPhone={target.phone} companyId={companyId}
-      contactId={contactId} conversationId={target.conversationId}
-      acquisitionId={acquisitionId} opportunityId={opportunityId} />}
+
   </>;
 }

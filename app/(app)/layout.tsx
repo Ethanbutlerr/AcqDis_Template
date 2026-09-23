@@ -8,6 +8,7 @@ import { useAuth } from '@/lib/auth/auth-context';
 import { usePermissions } from '@/lib/auth/use-permissions';
 import { useBranding, BrandingProvider } from '@/lib/auth/branding-context';
 import { ProtectedRoute } from '@/lib/auth/protected-route';
+import { OutboundCallProvider } from '@/components/conversations/outbound-call-provider';
 import { PermissionGate } from '@/components/permission-gate';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
@@ -70,7 +71,7 @@ export default function AppShellLayout({
   return (
     <ProtectedRoute>
       <BrandingProvider>
-        <AppShell>{children}</AppShell>
+        <OutboundCallProvider><AppShell>{children}</AppShell></OutboundCallProvider>
       </BrandingProvider>
     </ProtectedRoute>
   );

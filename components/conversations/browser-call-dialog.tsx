@@ -1,29 +1,26 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { Device, Call } from '@twilio/voice-sdk';
 import { supabase } from '@/lib/supabase/client';
 import { useAuth } from '@/lib/auth/auth-context';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
-import { Phone, PhoneOff, Loader2, Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
+import { Phone, PhoneOff, Loader2, Mic, MicOff, Minimize2 } from 'lucide-react';
+import type { OutboundCallTarget } from './outbound-call-context';
 
 type CallStatus = 'idle' | 'requesting_token' | 'connecting' | 'ringing' | 'connected' | 'ended' | 'failed' | 'number_busy';
 
-interface BrowserCallDialogProps {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  contactName: string;
-  contactPhone: string;
-  companyId: string;
-  conversationId?: string | null;
-  contactId?: string | null;
-  acquisitionId?: string | null;
-  opportunityId?: string | null;
+interface BrowserCallDialogProps extends OutboundCallTarget {
+  onClose: () => void;
+  minimized: boolean;
+  onMinimizedChange: (minimized: boolean) => void;
+  barHost: HTMLElement | null;
 }
 
-export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhone, companyId, conversationId, contactId, acquisitionId, opportunityId }: BrowserCallDialogProps) {
+export function BrowserCallDialog({ onClose, minimized, onMinimizedChange, barHost, contactName, contactPhone, companyId, conversationId, contactId, acquisitionId, opportunityId }: BrowserCallDialogProps) {
   const { profile, permissions } = useAuth();
   const canCall = !!profile?.is_agency_admin || permissions.includes('make_calls');
   const [status, setStatus] = useState<CallStatus>('idle');
@@ -38,6 +35,9 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
   const startingRef = useRef(false);
   const loggedRef = useRef(false);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const finishedRef = useRef(true);
+  const removeListenersRef = useRef<(() => void) | null>(null);
+  const restoreRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     return () => {
@@ -50,17 +50,9 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
       if (deviceRef.current) {
         try { deviceRef.current.destroy(); } catch {}
       }
+      removeListenersRef.current?.();
     };
   }, []);
-
-  useEffect(() => {
-    if (!open) {
-      setStatus('idle');
-      setError(null);
-      setElapsed(0);
-      setMuted(false);
-    }
-  }, [open]);
 
   const logCallToHistory = useCallback(async (duration: number, callStatus: 'completed' | 'no_answer' | 'failed') => {
     if (!profile?.id || loggedRef.current) return;
@@ -99,19 +91,40 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
     }
   }, [companyId, conversationId, contactId, contactPhone, profile?.id, acquisitionId, opportunityId]);
 
+  const finishCall = useCallback((result: 'ended' | 'failed', message?: string) => {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
+    attemptRef.current += 1;
+    startingRef.current = false;
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+    const duration = callStartRef.current
+      ? Math.floor((Date.now() - callStartRef.current.getTime()) / 1000) : 0;
+    setStatus(result);
+    setError(message ?? null);
+    void logCallToHistory(duration, result === 'failed' ? 'failed' : callStartRef.current ? 'completed' : 'no_answer');
+    callRef.current = null;
+    if (result === 'ended') closeTimerRef.current = setTimeout(onClose, 1500);
+  }, [logCallToHistory, onClose]);
+
   const startCall = useCallback(async () => {
     if (!canCall) { setError('Your role does not allow making calls.'); return; }
-    if (startingRef.current) return;
+    if (startingRef.current || !finishedRef.current) return;
     startingRef.current = true;
+    finishedRef.current = false;
     const attempt = ++attemptRef.current;
     callStartRef.current = null;
     loggedRef.current = false;
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
     setStatus('requesting_token');
     setError(null);
+    setElapsed(0);
+    setMuted(false);
 
     try {
       if (deviceRef.current) { deviceRef.current.destroy(); deviceRef.current = null; }
+      removeListenersRef.current?.();
+      removeListenersRef.current = null;
       // Check if the shared number is already in use by another user
       const { data: activeCalls } = await supabase
         .from('calls')
@@ -124,6 +137,7 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
 
       if (attempt !== attemptRef.current) return;
       if (activeCalls && activeCalls.length > 0) {
+        finishedRef.current = true;
         setStatus('number_busy');
         setError('The phone line is currently in use by another team member. Please wait and try again in a moment.');
         return;
@@ -139,9 +153,7 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
 
       if (attempt !== attemptRef.current) return;
       if (fnError || !data?.token) {
-        setStatus('failed');
-        setError(data?.error || fnError?.message || 'Failed to get voice token');
-        await logCallToHistory(0, 'failed');
+        finishCall('failed', data?.error || fnError?.message || 'Failed to get voice token');
         return;
       }
 
@@ -153,9 +165,14 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
       deviceRef.current = device;
 
       device.on('error', (err) => {
+        if (attempt !== attemptRef.current) return;
         console.error('Twilio Device error:', err);
-        setStatus('failed');
-        setError(err.message || 'Device error');
+        // An SDK error can be recoverable. Keep live call controls available.
+        if (callRef.current && callRef.current.status() !== Call.State.Closed) {
+          setError(err.message || 'Device error');
+        } else {
+          finishCall('failed', err.message || 'Device error');
+        }
       });
 
       // Outbound calls do not need device registration. The app shell owns the
@@ -175,64 +192,64 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
       if (attempt !== attemptRef.current) { call.disconnect(); device.destroy(); return; }
       callRef.current = call;
 
-      call.on('ringing', () => {
+      const onRinging = () => {
+        if (attempt !== attemptRef.current || callStartRef.current) return;
         setStatus('ringing');
-      });
+      };
 
-      call.on('accept', () => {
+      const onAccept = () => {
+        if (attempt !== attemptRef.current || callStartRef.current) return;
         setStatus('connected');
         callStartRef.current = new Date();
         setElapsed(0);
         timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
-      });
+      };
 
-      call.on('disconnect', () => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        const duration = callStartRef.current
-          ? Math.floor((Date.now() - callStartRef.current.getTime()) / 1000)
-          : 0;
-        setStatus('ended');
-        logCallToHistory(duration, duration > 0 ? 'completed' : 'no_answer');
-        closeTimerRef.current = setTimeout(() => onOpenChange(false), 1500);
-      });
-
-      call.on('cancel', () => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        setStatus('ended');
-        logCallToHistory(0, 'no_answer');
-        closeTimerRef.current = setTimeout(() => onOpenChange(false), 1500);
-      });
-
-      call.on('error', (err) => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        setStatus('failed');
-        setError(err.message || 'Call failed');
-        logCallToHistory(0, 'failed');
-      });
+      const onFinished = () => {
+        if (attempt === attemptRef.current) finishCall('ended');
+      };
+      const onError = (err: Error) => {
+        if (attempt !== attemptRef.current) return;
+        if (call.status() === Call.State.Closed) finishCall('failed', err.message || 'Call failed');
+        else setError(err.message || 'Call error');
+      };
+      call.on('ringing', onRinging);
+      call.on('accept', onAccept);
+      call.on('disconnect', onFinished);
+      call.on('cancel', onFinished);
+      call.on('error', onError);
+      removeListenersRef.current = () => {
+        call.removeListener('ringing', onRinging);
+        call.removeListener('accept', onAccept);
+        call.removeListener('disconnect', onFinished);
+        call.removeListener('cancel', onFinished);
+        call.removeListener('error', onError);
+      };
+      // connect() can resolve after the first SDK state transition.
+      if (call.status() === Call.State.Open) onAccept();
+      else if (call.status() === Call.State.Ringing) onRinging();
+      else if (call.status() === Call.State.Closed) onFinished();
 
     } catch (err: unknown) {
       if (attempt !== attemptRef.current) return;
-      setStatus('failed');
       const msg = err instanceof Error ? err.message : 'Unknown error starting call';
-      setError(msg);
-      await logCallToHistory(0, 'failed');
+      finishCall('failed', msg);
     } finally {
       if (attempt === attemptRef.current) startingRef.current = false;
     }
-  }, [canCall, companyId, contactPhone, profile?.id, onOpenChange, logCallToHistory]);
+  }, [canCall, companyId, contactPhone, profile?.id, finishCall]);
 
   const endCall = useCallback(() => {
-    attemptRef.current += 1;
-    startingRef.current = false;
-    if (callRef.current) {
-      try { callRef.current.disconnect(); } catch {}
-    }
+    if (finishedRef.current) return;
+    const call = callRef.current;
+    // Complete first: disconnect/destroy may emit synchronous terminal events.
+    finishCall('ended');
+    try { call?.disconnect(); } catch {}
     if (deviceRef.current) {
       try { deviceRef.current.destroy(); } catch {}
       deviceRef.current = null;
     }
-    setStatus('ended');
-  }, []);
+  }, [finishCall]);
 
   const toggleMute = useCallback(() => {
     if (callRef.current) {
@@ -242,14 +259,8 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
     }
   }, [muted]);
 
-  const handleClose = () => {
-    if (status === 'connected' || status === 'ringing' || status === 'connecting' || status === 'requesting_token') {
-      endCall();
-      onOpenChange(false);
-    } else {
-      onOpenChange(false);
-    }
-  };
+  const active = status === 'connected' || status === 'ringing' || status === 'connecting' || status === 'requesting_token';
+  const handleClose = () => active ? onMinimizedChange(true) : onClose();
 
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
@@ -257,9 +268,43 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
     return `${m}:${sec.toString().padStart(2, '0')}`;
   };
 
+  const statusLabel = {
+    idle: 'Ready to call', requesting_token: 'Initializing...', connecting: 'Connecting...',
+    ringing: 'Ringing...', connected: 'Connected', ended: 'Call ended', failed: 'Call failed', number_busy: 'Line Busy',
+  }[status];
+
+  if (minimized) {
+    return createPortal(
+      <section aria-label="Current call" className={`${barHost ? 'relative w-full' : 'fixed bottom-4 left-4 right-4 sm:right-auto sm:w-[380px]'} z-[60] rounded-lg border bg-background p-3 text-foreground shadow-lg`}>
+        <div className="flex items-start justify-between gap-2 text-sm">
+          <div className="min-w-0">
+            <p className="truncate font-medium" title={contactName}>{contactName}</p>
+            <p className="truncate font-mono text-xs text-muted-foreground">{contactPhone}</p>
+          </div>
+          <div className="shrink-0 text-right text-xs">
+            <p role="status">{statusLabel}</p>
+            {status === 'connected' && <span aria-label="Call duration" className="font-mono tabular-nums">{formatTime(elapsed)}</span>}
+          </div>
+        </div>
+        {error && <p role="alert" className="mt-1 text-xs text-destructive">{error}</p>}
+        <div className="mt-2 flex flex-wrap gap-2">
+          <Button ref={restoreRef} size="sm" variant="outline" onClick={() => onMinimizedChange(false)}>Restore</Button>
+          {active && <Button size="sm" variant="destructive" onClick={endCall} className="gap-2"><PhoneOff className="h-4 w-4" /> End Call</Button>}
+        </div>
+      </section>, barHost ?? document.body,
+    );
+  }
+
   return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-[360px]">
+    <Dialog open onOpenChange={(open) => { if (!open) handleClose(); }}>
+      <DialogContent className="max-w-[calc(100%-2rem)] sm:max-w-[360px] max-h-[calc(100dvh-2rem)] overflow-y-auto"
+        aria-describedby={undefined}
+        onCloseAutoFocus={(event) => {
+          if (restoreRef.current) {
+            event.preventDefault();
+            restoreRef.current.focus();
+          }
+        }}>
         <DialogHeader>
           <DialogTitle className="text-center">
             {status === 'idle' || status === 'failed' || status === 'number_busy' ? 'Call Contact' : 'In Call'}
@@ -311,6 +356,11 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
             </div>
           )}
 
+          {active && error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+          {active && <Button onClick={() => onMinimizedChange(true)} variant="outline" size="sm" className="gap-2">
+            <Minimize2 className="h-4 w-4" /> Minimize
+          </Button>}
+
           <div className="flex items-center gap-3 mt-2">
             {(status === 'idle' || status === 'failed') && (
               <Button disabled={!canCall} onClick={startCall} className="gap-2 bg-emerald-600 hover:bg-emerald-700">
@@ -327,6 +377,8 @@ export function BrowserCallDialog({ open, onOpenChange, contactName, contactPhon
                 onClick={toggleMute}
                 variant="outline"
                 size="icon"
+                aria-label={muted ? 'Unmute' : 'Mute'}
+                aria-pressed={muted}
                 className={muted ? 'text-red-500 border-red-200' : ''}
               >
                 {muted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}

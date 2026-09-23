@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, ReactNode } from 'react';
 import { useAuth } from '@/lib/auth/auth-context';
-import { BrowserCallDialog } from '@/components/conversations/browser-call-dialog';
+import { useOutboundCall } from '@/components/conversations/outbound-call-context';
 import { Message, Call, UserProfile, PhoneNumber } from '@/lib/types';
 import { ConversationWithContact, TimelineItem } from '@/app/(app)/conversations/page';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -193,7 +193,7 @@ export function ConversationThreadPanel({ conversation, timeline, loading, users
   const [sendChannel, setSendChannel] = useState<SendChannel>('sms');
   const [sending, setSending] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
-  const [callDialogOpen, setCallDialogOpen] = useState(false);
+  const { openCall } = useOutboundCall();
   const [attachmentsByMessage, setAttachmentsByMessage] = useState<Record<string, Attachment[]>>({});
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -290,25 +290,17 @@ export function ConversationThreadPanel({ conversation, timeline, loading, users
         </div>
         <div className="flex items-center gap-1.5">
           {contact?.primary_phone && (
-            <Button variant="ghost" size="icon" className="h-8 w-8" title="Call from browser" onClick={() => setCallDialogOpen(true)}>
+            <Button variant="ghost" size="icon" className="h-8 w-8" title="Call from browser" onClick={() => {
+              if (profile?.company_id) openCall({ contactName: name,
+                contactPhone: contact.primary_phone_normalized ?? contact.primary_phone!,
+                companyId: profile.company_id, conversationId: conversation.id, contactId: contact.id });
+            }}>
               <Phone className="h-4 w-4" />
             </Button>
           )}
           {rightAction}
         </div>
       </div>
-
-      {contact?.primary_phone && profile?.company_id && (
-        <BrowserCallDialog
-          open={callDialogOpen}
-          onOpenChange={setCallDialogOpen}
-          contactName={name}
-          contactPhone={contact.primary_phone_normalized ?? contact.primary_phone}
-          companyId={profile.company_id}
-          conversationId={conversation?.id}
-          contactId={contact.id}
-        />
-      )}
 
       {/* Timeline */}
       <ScrollArea className="flex-1 px-4 py-4">
