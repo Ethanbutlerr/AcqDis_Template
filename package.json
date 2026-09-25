@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test:call-window": "node --test scripts/tests/browser-call-window.cjs"
+    "test:call-window": "node --test scripts/tests/browser-call-window.cjs",
+    "test:incoming-calls": "node --test scripts/tests/incoming-call-window.cjs scripts/tests/inbound-routing.cjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.0",

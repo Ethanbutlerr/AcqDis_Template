@@ -158,11 +158,41 @@ async function getInboundRecipients(supabase: any, companyId: string, phoneNumbe
     }
   }
 
-  if (phoneNumber.assigned_user_id && permittedIds.has(phoneNumber.assigned_user_id)) {
-    return [phoneNumber.assigned_user_id];
+  // An assigned line must never fall back to other company users.
+  // Assignment does not bypass receive_calls or company membership.
+  if (phoneNumber.assigned_user_id) {
+    return permittedIds.has(phoneNumber.assigned_user_id) ? [phoneNumber.assigned_user_id] : [];
+  }
+
+  if (["dedicated", "personal"].includes(phoneNumber.number_type)) return [];
+
+  if (phoneNumber.number_type === "shared_acquisition_automation") {
+    // Shared Acquisition membership is role-based, not company-wide: members
+    // of the existing Acquisition system role without any assigned number.
+    const [{ data: acquisitionRoles, error: roleError }, { data: assignedNumbers, error: numberError }] = await Promise.all([
+      supabase.from("roles").select("id").eq("company_id", companyId)
+        .eq("name", "Acquisitions Manager").eq("is_system", true),
+      supabase.from("phone_numbers").select("assigned_user_id").eq("company_id", companyId)
+        .not("assigned_user_id", "is", null),
+    ]);
+    if (roleError || numberError) throw new Error("Unable to resolve shared Acquisition membership");
+    const acquisitionRoleIds = (acquisitionRoles ?? []).map((role: { id: string }) => role.id);
+    if (!acquisitionRoleIds.length) return [];
+    const { data: acquisitionMembers, error: memberError } = await supabase.from("user_roles")
+      .select("user_id").in("role_id", acquisitionRoleIds);
+    if (memberError) throw new Error("Unable to resolve shared Acquisition members");
+    const assignedIds = new Set((assignedNumbers ?? []).map((number: { assigned_user_id: string }) => number.assigned_user_id));
+    const recipients = Array.from(new Set((acquisitionMembers ?? [])
+      .map((member: { user_id: string }) => member.user_id)
+      .filter((id: string) => permittedIds.has(id) && !assignedIds.has(id)))) as string[];
+    if (recipients.length > 10) throw new Error("Shared inbound group exceeds the ten-recipient Dial limit");
+    return recipients;
   }
 
   if (phoneNumber.assigned_team_id) {
+    const { data: team } = await supabase.from("teams").select("id")
+      .eq("id", phoneNumber.assigned_team_id).eq("company_id", companyId).maybeSingle();
+    if (!team) return [];
     const { data: teamMembers } = await supabase
       .from("team_members")
       .select("user_id")
@@ -170,10 +200,14 @@ async function getInboundRecipients(supabase: any, companyId: string, phoneNumbe
     const teamRecipients = (teamMembers ?? [])
       .map((member: { user_id: string }) => member.user_id)
       .filter((userId: string) => permittedIds.has(userId));
-    if (teamRecipients.length) return Array.from(new Set(teamRecipients)).slice(0, 10) as string[];
+    const recipients = Array.from(new Set(teamRecipients)) as string[];
+    // Twilio Dial supports ten clients. Do not silently omit assigned members.
+    if (recipients.length > 10) throw new Error("Shared inbound team exceeds the ten-recipient Dial limit");
+    return recipients;
   }
 
-  return Array.from(permittedIds).slice(0, 10) as string[];
+  // A shared label or an empty Assigned User does not establish membership.
+  return [];
 }
 
 async function validateTwilioWebhook(
@@ -352,7 +386,7 @@ async function handleTwimlWebhook(req: Request): Promise<Response> {
     if (!companyId) {
       const { data: candidates } = await supabase
         .from("phone_numbers")
-        .select("id, company_id, number, assigned_user_id, assigned_team_id")
+        .select("id, company_id, number, number_type, assigned_user_id, assigned_team_id")
         .eq("provider", "twilio")
         .eq("registration_status", "registered")
         .eq("is_active", true);
