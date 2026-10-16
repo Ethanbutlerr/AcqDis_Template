@@ -75,13 +75,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setProfile(null);
       setPermissions([]);
       setSubscription(null);
+      if (!profileError && !signupInProgressRef.current) {
+        await supabase.auth.signOut({ scope: 'local' });
+        setUser(null);
+        setSession(null);
+      }
       return;
     }
 
     const typedProfile = profileData as UserProfile;
     setProfile(typedProfile);
 
-    if (typedProfile.is_disabled) {
+    if (typedProfile.is_disabled || typedProfile.deleted_at) {
       await supabase.auth.signOut();
       setProfile(null);
       setPermissions([]);
@@ -155,6 +160,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       authSub.unsubscribe();
     };
   }, [loadProfileAndPermissions]);
+
+  // Recheck an open tab as well as new logins. Database policies reject
+  // removed accounts immediately; this clears any already-rendered UI too.
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    const checkAccess = async () => {
+      if (signupInProgressRef.current) return;
+      const { data, error } = await supabase.from('profiles')
+        .select('id, is_disabled, deleted_at').eq('id', user.id).maybeSingle();
+      if (!cancelled && !error && (!data || data.is_disabled || data.deleted_at)) {
+        await supabase.auth.signOut({ scope: 'local' });
+        setUser(null);
+        setSession(null);
+        setProfile(null);
+        setPermissions([]);
+        setSubscription(null);
+      }
+    };
+    const interval = window.setInterval(checkAccess, 30000);
+    window.addEventListener('focus', checkAccess);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener('focus', checkAccess);
+    };
+  }, [user]);
 
   const signIn = useCallback(
     async (email: string, password: string) => {

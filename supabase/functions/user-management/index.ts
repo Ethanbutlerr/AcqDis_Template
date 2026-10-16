@@ -36,11 +36,11 @@ Deno.serve(async (req: Request) => {
 
     const { data: callerProfile } = await adminClient
       .from("profiles")
-      .select("company_id, is_disabled")
+      .select("company_id, is_disabled, deleted_at")
       .eq("id", callerId)
       .single();
 
-    if (!callerProfile || callerProfile.is_disabled) {
+    if (!callerProfile || callerProfile.is_disabled || callerProfile.deleted_at) {
       return jsonResponse({ error: "Account disabled" }, 403);
     }
 
@@ -152,6 +152,13 @@ Deno.serve(async (req: Request) => {
         return jsonResponse({ error: "Cannot disable your own account" }, 400);
       }
 
+      const { data: target, error: targetError } = await adminClient.from("profiles")
+        .select("id, deleted_at").eq("id", user_id)
+        .eq("company_id", callerProfile.company_id).maybeSingle();
+      if (targetError) return jsonResponse({ error: "Unable to verify the user" }, 500);
+      if (!target) return jsonResponse({ error: "User not found in your company" }, 404);
+      if (target.deleted_at) return jsonResponse({ error: "This user's access has been permanently removed" }, 400);
+
       await adminClient.from("profiles").update({
         is_disabled: disabled,
       }).eq("id", user_id);
@@ -258,22 +265,57 @@ Deno.serve(async (req: Request) => {
         return jsonResponse({ error: "Cannot delete your own account" }, 400);
       }
 
-      // Delete profile (cascades to user_roles, team_members)
-      await adminClient.from("profiles").delete().eq("id", user_id);
+      const { data: targetProfile, error: targetError } = await adminClient
+        .from("profiles")
+        .select("id, deleted_at")
+        .eq("id", user_id)
+        .eq("company_id", callerProfile.company_id)
+        .maybeSingle();
 
-      // Delete auth user
-      const { error: deleteError } = await adminClient.auth.admin.deleteUser(user_id);
-      if (deleteError) {
-        return jsonResponse({ error: deleteError.message }, 400);
+      if (targetError) {
+        console.error("Unable to look up user for deletion", targetError);
+        return jsonResponse({ error: "Unable to verify the user. Please try again." }, 500);
+      }
+      if (!targetProfile) {
+        return jsonResponse({ error: "User not found in your company" }, 404);
+      }
+      if (targetProfile.deleted_at) return jsonResponse({ success: true });
+
+      // Deny application/data access first, including existing JWTs. Keep the
+      // profile and all business relationships for historical attribution.
+      const { error: disableError } = await adminClient.from("profiles")
+        .update({ is_disabled: true }).eq("id", user_id)
+        .eq("company_id", callerProfile.company_id);
+      if (disableError) {
+        console.error("Unable to disable user", disableError);
+        return jsonResponse({ error: "Unable to remove access. Please try again." }, 500);
       }
 
-      await adminClient.from("audit_logs").insert({
+      // Soft-delete Auth credentials/sessions; a hard delete would cascade to
+      // the profile and erase names/assignments from historical records.
+      const { error: deleteError } = await adminClient.auth.admin.deleteUser(user_id, true);
+      if (deleteError) {
+        console.error("Unable to remove user credentials", deleteError);
+        return jsonResponse({ error: "The account is disabled, but access removal did not finish. Please retry." }, 500);
+      }
+
+      const { error: archiveError } = await adminClient.from("profiles")
+        .update({ deleted_at: new Date().toISOString(), is_disabled: true })
+        .eq("id", user_id).eq("company_id", callerProfile.company_id);
+      if (archiveError) {
+        console.error("Unable to archive user", archiveError);
+        return jsonResponse({ error: "Access was removed, but the users list could not be updated. Please retry." }, 500);
+      }
+
+      const { error: auditError } = await adminClient.from("audit_logs").insert({
+        company_id: callerProfile.company_id,
         user_id: callerId,
         action: "user_deleted",
         entity_type: "user",
         entity_id: user_id,
-        metadata: {},
+        metadata: { access_removed: true, history_preserved: true },
       });
+      if (auditError) console.error("User deleted but audit log failed", auditError);
 
       return jsonResponse({ success: true });
     }

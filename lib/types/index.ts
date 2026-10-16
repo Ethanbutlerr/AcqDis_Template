@@ -7,6 +7,7 @@ export interface UserProfile {
   timezone: string;
   notification_preferences: Record<string, unknown>;
   is_disabled: boolean;
+  deleted_at?: string | null;
   last_login_at: string | null;
   is_agency_admin?: boolean;
   home_company_id?: string | null;

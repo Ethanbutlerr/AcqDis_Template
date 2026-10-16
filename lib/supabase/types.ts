@@ -34,6 +34,7 @@ export interface Database {
           timezone: string;
           notification_preferences: Record<string, unknown>;
           is_disabled: boolean;
+          deleted_at: string | null;
           last_login_at: string | null;
           created_at: string;
           updated_at: string;

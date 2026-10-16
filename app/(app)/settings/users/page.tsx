@@ -65,6 +65,7 @@ function UsersSettings() {
   const [createSuccess, setCreateSuccess] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [roleTarget, setRoleTarget] = useState<UserRow | null>(null);
   const [additionalRoleId, setAdditionalRoleId] = useState('');
   const [addingRole, setAddingRole] = useState(false);
@@ -81,6 +82,7 @@ function UsersSettings() {
         user_roles ( role_id )
       `)
       .eq('company_id', profile!.company_id)
+      .is('deleted_at', null)
       .order('created_at', { ascending: true });
 
     if (queryError) {
@@ -221,9 +223,9 @@ function UsersSettings() {
   };
 
   const handleDelete = async () => {
-    if (!deleteTarget) return;
+    if (!deleteTarget || deleting) return;
     setDeleting(true);
-    setError(null);
+    setDeleteError(null);
     try {
       const { data: session } = await supabase.auth.getSession();
       const token = session.session?.access_token;
@@ -242,12 +244,15 @@ function UsersSettings() {
       );
 
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Failed to delete user');
+      if (!response.ok || result.success !== true) {
+        throw new Error(result.error || 'Failed to delete user');
+      }
 
+      setUsers((current) => current.filter((user) => user.id !== deleteTarget.id));
       setDeleteTarget(null);
       await loadUsers();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
+      setDeleteError(err instanceof Error ? err.message : 'Failed to delete user');
     } finally {
       setDeleting(false);
     }
@@ -441,7 +446,10 @@ function UsersSettings() {
                       <Button
                         variant="ghost"
                         size="icon"
-                        onClick={() => setDeleteTarget(u)}
+                        onClick={() => {
+                          setDeleteError(null);
+                          setDeleteTarget(u);
+                        }}
                         title="Delete user"
                         className="text-destructive hover:text-destructive"
                       >
@@ -486,23 +494,29 @@ function UsersSettings() {
         </DialogContent>
       </Dialog>
 
-      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => {
+        if (!open && !deleting) setDeleteTarget(null);
+      }}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete user?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete {deleteTarget?.full_name} ({deleteTarget?.email}) and remove all their data. This action cannot be undone.
+              This will permanently remove website access for {deleteTarget?.full_name} ({deleteTarget?.email}) and remove them from this users list. Their leads, pipeline positions, assignments, and activity history will stay unchanged, including their name on past actions.
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {deleteError && <p role="alert" className="text-sm text-destructive">{deleteError}</p>}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
             <AlertDialogAction
-              onClick={handleDelete}
+              onClick={(event) => {
+                event.preventDefault();
+                void handleDelete();
+              }}
               disabled={deleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Delete user
+              {deleting ? 'Deleting...' : 'Delete user'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
