@@ -629,7 +629,11 @@ Deno.serve(async (req: Request) => {
         const detail = [keyResponse.status, twilioError.code, String(twilioError.message ?? "").slice(0, 160)]
           .filter(Boolean).join(" / ");
         console.error("Twilio browser key creation failed", detail);
-        return new Response(JSON.stringify({ error: `Twilio rejected browser key creation (${detail}). Check the Account SID and Auth Token in Settings > Integrations.` }), {
+        const inactive = /not active/i.test(String(twilioError.message ?? ""));
+        const guidance = inactive
+          ? "The configured Twilio account is inactive. Restore it in Twilio Console, or enter the SID and Auth Token of the active account that owns your phone numbers in Settings > Integrations."
+          : "Check the Account SID and Auth Token in Settings > Integrations.";
+        return new Response(JSON.stringify({ error: `Twilio rejected browser key creation (${detail}). ${guidance}` }), {
           status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
