@@ -13,9 +13,11 @@ type DeviceStatus = 'checking' | 'ready' | 'unavailable' | 'error';
 type IncomingStatus = 'ringing' | 'connecting' | 'connected' | 'ended';
 
 function callingError(error: unknown): string {
-  const value = error as { message?: string; code?: number; twilioError?: { code?: number; message?: string } } | null;
+  const value = error as { name?: string; description?: string; message?: string; code?: number; twilioError?: { code?: number; message?: string } } | null;
   const code = value?.twilioError?.code ?? value?.code;
-  const message = value?.twilioError?.message || value?.message || 'Twilio could not connect this browser to calling.';
+  const message = value?.twilioError?.message || value?.message || value?.description
+    || (typeof error === 'string' ? error : '')
+    || 'Twilio signaling disconnected before calling was ready. Check this browser’s connection to Twilio.';
   return code ? `${message} (Twilio ${code})` : message;
 }
 
@@ -44,6 +46,7 @@ export function IncomingCallListener() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const setupAttemptRef = useRef(0);
   const deviceRef = useRef<Device | null>(null);
+  const deviceErrorRef = useRef<unknown>(null);
   const freshTokenRequiredRef = useRef(false);
   const scopeRef = useRef<string | null>(null);
   const removeCallListenersRef = useRef<(() => void) | null>(null);
@@ -150,6 +153,7 @@ export function IncomingCallListener() {
     if (scopeRef.current !== scope) setPanelOpen(false);
     scopeRef.current = scope;
     clearIncomingCall();
+    deviceErrorRef.current = null;
     setIncomingStatus('ringing');
     setError(null);
     setDeviceStatus(canReceiveCalls ? 'checking' : 'unavailable');
@@ -180,11 +184,12 @@ export function IncomingCallListener() {
         freshTokenRequiredRef.current = false;
         registeredDevice.on('incoming', (call) => { if (current()) handleIncoming(call); });
         registeredDevice.on('registered', () => {
-          if (current()) { setDeviceStatus('ready'); setError(null); }
+          if (current()) { deviceErrorRef.current = null; setDeviceStatus('ready'); setError(null); }
         });
         registeredDevice.on('unregistered', () => { if (current()) setDeviceStatus('unavailable'); });
         registeredDevice.on('error', (deviceError) => {
           if (!current()) return;
+          deviceErrorRef.current = deviceError;
           if (needsFreshToken(deviceError)) freshTokenRequiredRef.current = true;
           setError(callingError(deviceError));
           setDeviceStatus('error');
@@ -196,6 +201,7 @@ export function IncomingCallListener() {
             if (token && current()) registeredDevice.updateToken(token);
           } catch (tokenError) {
             if (!current()) return;
+            deviceErrorRef.current = tokenError;
             freshTokenRequiredRef.current = true;
             setError(callingError(tokenError));
             setDeviceStatus('error');
@@ -204,7 +210,9 @@ export function IncomingCallListener() {
         await registeredDevice.register();
       } catch (setupError) {
         if (!current()) return;
-        setError(callingError(setupError));
+        // Twilio's register() promise rejects with no value on an
+        // 'unregistered' event. Keep the error from the preceding SDK event.
+        setError(callingError(setupError ?? deviceErrorRef.current));
         setDeviceStatus('error');
       }
     }
@@ -225,10 +233,11 @@ export function IncomingCallListener() {
       // Invoke register directly from the click; some browsers require the
       // registration's audio setup to begin in a user gesture.
       setError(null);
+      deviceErrorRef.current = null;
       setDeviceStatus('checking');
       void device.register().catch((registerError) => {
         if (deviceRef.current !== device) return;
-        setError(callingError(registerError));
+        setError(callingError(registerError ?? deviceErrorRef.current));
         setDeviceStatus('error');
       });
       return;

@@ -42,7 +42,17 @@ class MockCall extends EventEmitter {
 class MockDevice extends EventEmitter {
   registers = 0; destroys = 0; refreshed = []; state = 'unregistered';
   constructor(token) { super(); this.token = token; devices.push(this); }
-  async register() { this.registers++; if (registerError) throw new Error('Mock registration failed'); this.state = 'registered'; this.emit('registered'); }
+  async register() {
+    this.registers++;
+    if (registerError === 'offline') {
+      this.state = 'unregistered';
+      this.emit('error', { code: 31005, message: 'Signaling connection closed' });
+      this.emit('unregistered');
+      throw undefined; // Twilio's register() rejects without a value on this event.
+    }
+    if (registerError) throw new Error('Mock registration failed');
+    this.state = 'registered'; this.emit('registered');
+  }
   destroy() { this.destroys++; this.state = 'destroyed'; this.removeAllListeners(); }
   updateToken(token) { this.refreshed.push(token); }
 }
@@ -199,6 +209,14 @@ test('Twilio error codes are visible and retry retains the open panel', async ()
   assert.match(document.body.textContent, /No incoming calls/);
   assert.equal(devices.length,2); assert.equal(devices[0].destroys,1);
   assert.equal(devices[1].registers,1);
+});
+test('an undefined registration rejection preserves the Twilio signaling error', async () => {
+  reset(); registerError = 'offline'; await mount(); await click('Open incoming calls');
+  assert.match(document.body.textContent, /Signaling connection closed \(Twilio 31005\)/);
+  await click('Reconnect calling');
+  assert.match(document.body.textContent, /Signaling connection closed \(Twilio 31005\)/);
+  registerError = false; await click('Reconnect calling');
+  assert.match(document.body.textContent, /No incoming calls/);
 });
 test('no configured number is unavailable, not empty', async () => {
   reset(); activeNumber = false; await mount(); await click('Open incoming calls');
