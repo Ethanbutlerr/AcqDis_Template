@@ -1,6 +1,8 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { rankManagers, type PerformanceMetric } from '@/lib/utils/scoreboard';
+import { useCrmRefresh } from '@/hooks/use-crm-refresh';
 import { supabase } from '@/lib/supabase/client';
 import { useAuth } from '@/lib/auth/auth-context';
 import { usePermissions } from '@/lib/auth/use-permissions';
@@ -14,6 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { formatCurrency } from '@/lib/utils/format';
+import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { Trophy, TrendingUp, TrendingDown, Clock, Settings2, UserPlus } from 'lucide-react';
 
@@ -27,6 +30,7 @@ interface ScoreboardManager {
   signed_contracts: number;
   dials_period: number;
   dials_today: number;
+  dials_week: number;
   rank: number;
   has_activity: boolean;
   prev_rank: number | null;
@@ -38,6 +42,10 @@ interface ScoreboardData {
   period_start: string;
   period_end: string;
   generated_at: string;
+  unattributed_contracts?: number;
+  undated_contracts?: number;
+  excluded_contracts?: number;
+  timezone?: string;
 }
 
 type ScoreboardPeriod = 'today' | 'week' | 'month' | 'all';
@@ -78,7 +86,7 @@ const PODIUM_STYLES = [
 
 const RANK_LABELS = ['1st', '2nd', '3rd'];
 
-function PodiumCard({ manager, isCurrentUser }: { manager: ScoreboardManager; isCurrentUser: boolean }) {
+function PodiumCard({ manager, isCurrentUser, metric }: { manager: ScoreboardManager; isCurrentUser: boolean; metric: PerformanceMetric }) {
   const idx = manager.rank - 1;
   return (
     <div
@@ -107,7 +115,8 @@ function PodiumCard({ manager, isCurrentUser }: { manager: ScoreboardManager; is
         <p className={cn('text-sm font-semibold truncate max-w-[120px]', isCurrentUser && 'text-primary')}>
           {manager.full_name}
         </p>
-        <p className="text-lg font-bold text-emerald-600 mt-0.5">{formatCurrency(manager.verified_revenue)}</p>
+        <p className="text-lg font-bold text-emerald-600 mt-0.5">{metric === 'verified_revenue' ? formatCurrency(manager.verified_revenue) : manager[metric].toLocaleString()}</p>
+        <p className="text-xs text-muted-foreground">{metric.replace(/_/g,' ')}</p>
         <p className="text-xs text-muted-foreground">{manager.closed_deals} deal{manager.closed_deals !== 1 ? 's' : ''} closed</p>
       </div>
       <RankMovement current={manager.rank} previous={manager.prev_rank} hasActivity={manager.has_activity} />
@@ -164,12 +173,14 @@ function ManageScoreboardDialog({ companyId, onSaved }: { companyId: string; onS
       .maybeSingle();
 
     if (existing) {
-      await supabase.from('scoreboard_members')
+      const { error } = await supabase.from('scoreboard_members')
         .update({ is_included: include, updated_at: new Date().toISOString(), removed_by: include ? null : undefined })
         .eq('id', existing.id);
+      if (error) { toast.error(error.message); setSaving(null); return; }
     } else {
-      await supabase.from('scoreboard_members')
+      const { error } = await supabase.from('scoreboard_members')
         .insert({ company_id: companyId, user_id: userId, is_included: include, reason: 'Added via manage scoreboard' });
+      if (error) { toast.error(error.message); setSaving(null); return; }
     }
 
     setUsers((prev) => prev.map((u) => u.user_id === userId ? { ...u, is_included: include } : u));
@@ -224,17 +235,24 @@ function ManageScoreboardDialog({ companyId, onSaved }: { companyId: string; onS
 
 export function AcquisitionsScoreboard() {
   const { profile } = useAuth();
+  return <AcquisitionsScoreboardContent key={`${profile?.company_id}:${profile?.id}`} />;
+}
+
+function AcquisitionsScoreboardContent() {
+  const { profile } = useAuth();
   const { hasPermission } = usePermissions();
   const companyId = profile?.company_id ?? null;
   const canManage = hasPermission('manage_users');
-  const [period, setPeriod] = useState<ScoreboardPeriod>('week');
+  const requestVersion = useRef(0);
+  const [metric, setMetric] = useState<PerformanceMetric>('verified_revenue');
+  const [period, setPeriod] = useState<ScoreboardPeriod>('all');
   const [data, setData] = useState<ScoreboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const loadScoreboard = useCallback(async () => {
     if (!companyId) return;
-    setLoading(true);
+    const version = ++requestVersion.current;
     setError(null);
 
     const { data: result, error: rpcError } = await supabase.rpc('get_scoreboard_data', {
@@ -242,6 +260,7 @@ export function AcquisitionsScoreboard() {
       p_company_id: companyId,
     });
 
+    if (version !== requestVersion.current) return;
     if (rpcError) {
       setError(rpcError.message);
     } else if (result) {
@@ -250,23 +269,21 @@ export function AcquisitionsScoreboard() {
     setLoading(false);
   }, [companyId, period]);
 
-  useEffect(() => { loadScoreboard(); }, [loadScoreboard]);
+  useEffect(() => { void loadScoreboard(); const requests = requestVersion; return () => { requests.current++; }; }, [loadScoreboard]);
 
-  useEffect(() => {
-    const interval = setInterval(loadScoreboard, 60000);
-    return () => clearInterval(interval);
-  }, [loadScoreboard]);
+  useCrmRefresh(companyId, ['acquisition_records','disposition_records','calls','scoreboard_members'], loadScoreboard);
 
   const currentUserId = profile?.id;
-  const myRank = data?.managers.find((m) => m.user_id === currentUserId);
-  const podium = data?.managers.slice(0, 3) ?? [];
-  const allManagers = data?.managers ?? [];
+  const allManagers = useMemo(() => rankManagers(data?.managers ?? [], metric), [data, metric]);
+  const myRank = allManagers.find((m) => m.user_id === currentUserId);
+  const podium = allManagers.filter((m) => m.rank <= 3 && m.has_activity);
 
-  if (error) {
+  if (error && !data) {
     return (
       <Card>
         <CardContent className="py-8">
           <p className="text-sm text-center text-muted-foreground">Unable to load scoreboard data.</p>
+          <Button variant="outline" size="sm" className="mt-3" onClick={() => void loadScoreboard()}>Retry</Button>
         </CardContent>
       </Card>
     );
@@ -288,6 +305,15 @@ export function AcquisitionsScoreboard() {
                 <RankMovement current={myRank.rank} previous={myRank.prev_rank} hasActivity={myRank.has_activity} />
               </div>
             )}
+            <Select value={metric} onValueChange={(value) => setMetric(value as PerformanceMetric)}>
+              <SelectTrigger className="w-[145px] h-8 text-xs" aria-label="Ranking metric"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="verified_revenue">Verified revenue</SelectItem>
+                <SelectItem value="closed_deals">Closed deals</SelectItem>
+                <SelectItem value="signed_contracts">Contracts</SelectItem>
+                <SelectItem value="dials_period">Dials</SelectItem>
+              </SelectContent>
+            </Select>
             <Select value={period} onValueChange={(v) => setPeriod(v as ScoreboardPeriod)}>
               <SelectTrigger className="w-[130px] h-8 text-xs">
                 <SelectValue />
@@ -305,7 +331,11 @@ export function AcquisitionsScoreboard() {
         </div>
       </CardHeader>
       <CardContent className="space-y-5">
-        {loading ? (
+        <p className="text-xs text-muted-foreground">Performance period: {PERIOD_OPTIONS.find((p) => p.value === period)?.label}. Contracts use their recorded execution date. {data?.timezone && `Timezone: ${data.timezone}.`} Rankings reflect records visible to you.</p>
+        {!!data?.excluded_contracts && <p className="text-xs text-amber-500">{data.excluded_contracts} contracts belong to users outside the current scoreboard membership.</p>}
+        {!!(data?.unattributed_contracts || data?.undated_contracts) && <p role="status" className="text-xs text-amber-500">Needs reconciliation: {data?.unattributed_contracts ?? 0} unattributed contracts; {data?.undated_contracts ?? 0} contracts missing execution dates.</p>}
+        {error && <p role="status" className="text-xs text-amber-500">Refresh failed. Showing the last successful results.</p>}
+        {loading && !data ? (
           <div className="space-y-4">
             <div className="grid grid-cols-3 gap-3">
               {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-[160px] rounded-xl" />)}
@@ -323,7 +353,7 @@ export function AcquisitionsScoreboard() {
             {podium.length > 0 && (
               <div className={cn('grid gap-3', podium.length >= 3 ? 'grid-cols-3' : podium.length === 2 ? 'grid-cols-2' : 'grid-cols-1 max-w-[200px] mx-auto')}>
                 {podium.map((m) => (
-                  <PodiumCard key={m.user_id} manager={m} isCurrentUser={m.user_id === currentUserId} />
+                  <PodiumCard key={m.user_id} manager={m} metric={metric} isCurrentUser={m.user_id === currentUserId} />
                 ))}
               </div>
             )}
@@ -340,6 +370,7 @@ export function AcquisitionsScoreboard() {
                     <th className="py-2.5 px-3 text-right font-medium text-muted-foreground hidden sm:table-cell">Deals</th>
                     <th className="py-2.5 px-3 text-right font-medium text-muted-foreground hidden md:table-cell">Contracts</th>
                     <th className="py-2.5 px-3 text-right font-medium text-muted-foreground hidden md:table-cell">Dials Today</th>
+                    <th className="py-2.5 px-3 text-right font-medium text-muted-foreground hidden md:table-cell">Dials This Week</th>
                     <th className="py-2.5 px-3 text-right font-medium text-muted-foreground hidden lg:table-cell">Dials ({PERIOD_OPTIONS.find((o) => o.value === period)?.label})</th>
                     <th className="py-2.5 px-3 text-center font-medium text-muted-foreground w-14"></th>
                   </tr>
@@ -384,6 +415,7 @@ export function AcquisitionsScoreboard() {
                         <td className="py-2.5 px-3 text-right hidden sm:table-cell">{m.closed_deals}</td>
                         <td className="py-2.5 px-3 text-right hidden md:table-cell">{m.signed_contracts}</td>
                         <td className="py-2.5 px-3 text-right hidden md:table-cell">{m.dials_today}</td>
+                        <td className="py-2.5 px-3 text-right hidden md:table-cell">{m.dials_week ?? 0}</td>
                         <td className="py-2.5 px-3 text-right hidden lg:table-cell">{m.dials_period}</td>
                         <td className="py-2.5 px-3 text-center">
                           <RankMovement current={m.rank} previous={m.prev_rank} hasActivity={m.has_activity} />

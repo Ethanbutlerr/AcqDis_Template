@@ -29,6 +29,7 @@ export async function movePipelineStage<T>({
   if (error) throw new Error(error.message);
   const result = data as { record?: T } | null;
   if (!result?.record) throw new Error('The stage move completed without returning the saved record.');
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('crm:changed'));
   return result.record;
 }
 
@@ -56,6 +57,7 @@ export async function createAcquisitionOpportunity<T>({
   if (error) throw new Error(error.message);
   const result = data as { record?: T } | null;
   if (!result?.record) throw new Error('The opportunity was created without returning its acquisition record.');
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('crm:changed'));
   return result.record;
 }
 
@@ -86,5 +88,6 @@ export async function createPipelineOpportunity<T>({
   if (error) throw new Error(error.message);
   const result = data as { record?: T; pipeline?: string } | null;
   if (!result?.record) throw new Error('The opportunity was created without returning its pipeline record.');
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('crm:changed'));
   return result as { record: T; pipeline?: string };
 }

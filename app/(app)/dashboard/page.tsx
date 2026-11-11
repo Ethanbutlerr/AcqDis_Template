@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useCrmRefresh } from '@/hooks/use-crm-refresh';
 import { supabase } from '@/lib/supabase/client';
 import { useAuth } from '@/lib/auth/auth-context';
 import { usePermissions } from '@/lib/auth/use-permissions';
@@ -20,6 +21,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from '@/components/ui/chart';
 import { formatCurrency, formatRelativeTime } from '@/lib/utils/format';
+import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import type {
   DashboardKpis, DashboardTasks, DashboardTask, DashboardPreferences,
@@ -49,7 +51,7 @@ const DATE_RANGES: { key: DateRangeKey; label: string }[] = [
   { key: 'custom', label: 'Custom Range' },
 ];
 
-function getDateRange(range: DateRangeKey, custom?: { start: Date; end: Date }): { start: string; end: string } {
+function getLocalDateRange(range: DateRangeKey, custom?: { start: Date; end: Date }): { start: string; end: string } {
   const now = new Date();
   switch (range) {
     case 'today':
@@ -76,6 +78,11 @@ function getDateRange(range: DateRangeKey, custom?: { start: Date; end: Date }):
         end: custom ? format(custom.end, 'yyyy-MM-dd') + 'T23:59:59' : format(now, 'yyyy-MM-dd') + 'T23:59:59',
       };
   }
+}
+
+function getDateRange(range: DateRangeKey, custom?: { start: Date; end: Date }) {
+  const local = getLocalDateRange(range, custom);
+  return { start: new Date(local.start).toISOString(), end: new Date(local.end.replace('23:59:59','23:59:59.999')).toISOString() };
 }
 
 // ─── KPI card config ─────────────────────────────────────────────────────────
@@ -190,6 +197,11 @@ function TaskItem({ task, onComplete }: { task: DashboardTask; onComplete: (id: 
 
 export default function DashboardPage() {
   const { profile } = useAuth();
+  return <DashboardContent key={`${profile?.company_id}:${profile?.id}`} />;
+}
+
+function DashboardContent() {
+  const { profile } = useAuth();
   const { hasPermission } = usePermissions();
   const { company } = useBranding();
   const companyId = profile?.company_id ?? null;
@@ -219,6 +231,8 @@ export default function DashboardPage() {
   const [cardOrder, setCardOrder] = useState<string[]>([...KPI_CARD_KEYS]);
   const [hiddenCards, setHiddenCards] = useState<string[]>([]);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const requestVersion = useRef(0);
+  const [refreshError, setRefreshError] = useState('');
   const dragKey = useRef<string | null>(null);
 
   // Load preferences
@@ -258,11 +272,13 @@ export default function DashboardPage() {
   // Load all data
   const loadAll = useCallback(async () => {
     if (!companyId || !prefsLoaded) return;
-    setLoading(true);
+    const version = ++requestVersion.current;
+    setRefreshError('');
     const { start, end } = getDateRange(dateRange, customRange);
 
+    try {
     const [kpisRes, tasksRes, convRes, revMonthRes, revUserRes, sourceRes, stageRes, dispStageRes, campaignRes, daysRes, deadRes] = await Promise.all([
-      supabase.rpc('get_dashboard_kpis', { p_company_id: companyId, p_start_date: start, p_end_date: end, p_user_id: canViewAllRevenue ? null : profile?.id, p_include_demo: includeDemo }),
+      supabase.rpc('get_dashboard_kpis', { p_company_id: companyId, p_start_date: start, p_end_date: end, p_user_id: profile?.id, p_include_demo: includeDemo }),
       supabase.rpc('get_dashboard_tasks', { p_company_id: companyId, p_user_id: profile?.id }),
       supabase.rpc('get_conversion_metrics', { p_company_id: companyId, p_start_date: start, p_end_date: end }),
       supabase.rpc('get_revenue_by_month', { p_company_id: companyId, p_start_date: start, p_end_date: end }),
@@ -275,6 +291,8 @@ export default function DashboardPage() {
       supabase.rpc('get_dead_lost_reasons', { p_company_id: companyId, p_start_date: start, p_end_date: end }),
     ]);
 
+    if (version !== requestVersion.current) return;
+    if (kpisRes.error || tasksRes.error) setRefreshError('Some dashboard data could not be refreshed. Showing the last successful results.');
     if (kpisRes.data) setKpis(kpisRes.data as DashboardKpis);
     if (tasksRes.data) setTasks(tasksRes.data as DashboardTasks);
     if (convRes.data) setConversion(convRes.data as Record<string, number>);
@@ -293,9 +311,11 @@ export default function DashboardPage() {
         .select('id, user_id, company_revenue, personal_earnings, payout_status')
         .eq('company_id', companyId)
         .order('created_at', { ascending: false });
+      if (version !== requestVersion.current) return;
       if (earnData) {
         const userIds = Array.from(new Set(earnData.map((e: Record<string, unknown>) => e.user_id as string)));
         const { data: users } = await supabase.from('profiles').select('id, full_name').in('id', userIds);
+        if (version !== requestVersion.current) return;
         const userMap: Record<string, string> = {};
         (users ?? []).forEach((u: Record<string, unknown>) => { userMap[u.id as string] = u.full_name as string; });
         setEarnings(earnData.map((e: Record<string, unknown>) => ({
@@ -311,6 +331,7 @@ export default function DashboardPage() {
         .select('id, user_id, company_revenue, personal_earnings, payout_status')
         .eq('company_id', companyId).eq('user_id', profile?.id ?? '')
         .order('created_at', { ascending: false });
+      if (version !== requestVersion.current) return;
       if (myEarn) {
         setEarnings(myEarn.map((e: Record<string, unknown>) => ({
           id: e.id as string, user_id: e.user_id as string,
@@ -321,15 +342,14 @@ export default function DashboardPage() {
       }
     }
 
-    setLoading(false);
+    } catch {
+      if (version === requestVersion.current) setRefreshError('Dashboard refresh failed. Showing the last successful results.');
+    } finally { if (version === requestVersion.current) setLoading(false); }
   }, [companyId, dateRange, customRange, includeDemo, canViewAllRevenue, profile?.id, prefsLoaded]);
 
-  useEffect(() => { loadAll(); }, [loadAll]);
+  useEffect(() => { void loadAll(); const requests = requestVersion; return () => { requests.current++; }; }, [loadAll]);
 
-  useEffect(() => {
-    const interval = setInterval(() => { loadAll(); }, 30000);
-    return () => clearInterval(interval);
-  }, [loadAll]);
+  useCrmRefresh(companyId, ['acquisition_records','disposition_records','revenue_attributions','user_earnings','tasks'], loadAll);
 
   // Drag and drop handlers
   const handleDragStart = (e: React.DragEvent, key: string) => { dragKey.current = key; };
@@ -367,13 +387,15 @@ export default function DashboardPage() {
   };
 
   const completeTask = async (taskId: string) => {
-    await supabase.from('tasks').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', taskId);
-    loadAll();
+    const { error } = await supabase.from('tasks').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', taskId);
+    if (error) { toast.error(error.message); return; }
+    void loadAll();
   };
 
   const updatePayoutStatus = async (earningId: string, status: PayoutStatus) => {
-    await supabase.from('user_earnings').update({ payout_status: status, updated_at: new Date().toISOString() }).eq('id', earningId);
-    loadAll();
+    const { error } = await supabase.from('user_earnings').update({ payout_status: status, updated_at: new Date().toISOString() }).eq('id', earningId);
+    if (error) { toast.error(error.message); return; }
+    void loadAll();
   };
 
   const firstName = profile?.full_name?.split(' ')[0] ?? 'there';
@@ -392,6 +414,7 @@ export default function DashboardPage() {
   return (
     <div className="space-y-6 p-6 animate-in">
       <SetupBanner />
+      {refreshError && <p role="status" className="text-sm text-amber-500">{refreshError}</p>}
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
@@ -499,7 +522,7 @@ export default function DashboardPage() {
 
       {/* KPI Cards - Consolidated 6-card grid */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {loading || !kpis
+        {!kpis
           ? Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-[110px] rounded-lg" />)
           : (
             <>
@@ -794,7 +817,7 @@ export default function DashboardPage() {
       <Card>
         <CardHeader><CardTitle className="text-base">Tasks</CardTitle></CardHeader>
         <CardContent>
-          {loading || !tasks ? (
+          {!tasks ? (
             <div className="space-y-2">
               {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-12 w-full rounded-md" />)}
             </div>

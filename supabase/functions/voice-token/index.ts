@@ -321,9 +321,15 @@ async function handleInboundStatusCallback(req: Request): Promise<Response> {
 
     const dialStatus = callbackParams.DialCallStatus || callbackParams.CallStatus || "";
     const duration = parseInt(callbackParams.DialCallDuration || callbackParams.CallDuration || "0", 10);
+    // Intermediate callbacks are not missed calls and must not overwrite a
+    // terminal state or create an unread notification.
+    if (!["completed", "failed", "busy", "no-answer", "canceled"].includes(dialStatus)) {
+      return new Response("OK", { status: 200, headers: corsHeaders });
+    }
     const completed = dialStatus === "completed";
     const failed = dialStatus === "failed";
     const missed = ["busy", "no-answer", "canceled"].includes(dialStatus) || (!completed && !failed);
+    if (missed && call.answered_at) return new Response("OK", { status: 200, headers: corsHeaders });
     const status = completed ? "completed" : failed ? "failed" : "missed";
 
     await supabase.from("calls").update({
@@ -333,29 +339,22 @@ async function handleInboundStatusCallback(req: Request): Promise<Response> {
       updated_at: new Date().toISOString(),
     }).eq("id", call.id);
 
-    if (missed && call.phone_number_id) {
+    if (missed && !call.answered_at && call.phone_number_id) {
       const { data: phoneNumber } = await supabase.from("phone_numbers").select("*").eq("id", call.phone_number_id).maybeSingle();
       if (phoneNumber) {
         const recipientIds = await getInboundRecipients(supabase, call.company_id, phoneNumber);
         for (const userId of recipientIds) {
-          const { data: existing } = await supabase.from("notifications")
-            .select("id")
-            .eq("user_id", userId)
-            .eq("type", "missed_call")
-            .eq("entity_type", "call")
-            .eq("entity_id", call.id)
-            .maybeSingle();
-          if (!existing) {
-            await supabase.from("notifications").insert({
-              company_id: call.company_id,
-              user_id: userId,
-              type: "missed_call",
-              title: "Missed call",
-              body: `Missed incoming call from ${call.from_number || "an unknown number"}.`,
-              entity_type: "call",
-              entity_id: call.id,
-            });
-          }
+          const { error: notificationError } = await supabase.from("notifications").upsert({
+            company_id: call.company_id,
+            user_id: userId,
+            type: "missed_call",
+            title: "Missed call",
+            body: `Missed incoming call from ${call.from_number || "an unknown number"}.`,
+            entity_type: "call",
+            entity_id: call.id,
+            event_key: `missed_call:${call.id}`,
+          }, { onConflict: "company_id,user_id,event_key", ignoreDuplicates: true });
+          if (notificationError) throw notificationError;
         }
       }
     }
@@ -363,7 +362,7 @@ async function handleInboundStatusCallback(req: Request): Promise<Response> {
     return new Response("OK", { status: 200, headers: corsHeaders });
   } catch (err) {
     console.error("Inbound call status callback error:", err);
-    return new Response("OK", { status: 200, headers: corsHeaders });
+    return new Response("Status callback failed", { status: 500, headers: corsHeaders });
   }
 }
 

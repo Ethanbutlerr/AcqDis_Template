@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('typescript');
 const source = fs.readFileSync(path.join(__dirname, '../../supabase/functions/voice-token/index.ts'), 'utf8').replace(/^import .*;\r?$/gm, '');
-const code = ts.transpileModule(source + '\nglobalThis.routing = { getInboundRecipients, voiceIdentity };', {
+const code = ts.transpileModule(source + '\nglobalThis.routing = { getInboundRecipients, voiceIdentity, handleInboundStatusCallback };', {
   compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
 }).outputText;
 
@@ -30,21 +30,31 @@ function fixture(authId = 'user-a', options = {}) {
     team_members: [{ team_id: 'team-1', user_id: 'user-a' }, { team_id: 'team-1', user_id: 'user-b' }, { team_id: 'team-1', user_id: 'unauthorized' }, { team_id: 'team-1', user_id: 'foreign' }],
     company_credentials: ['account_sid', 'auth_token', 'twiml_app_sid', 'api_key_sid', 'api_key_secret'].map((key) => ({ company_id: 'company-1', provider: 'twilio', credential_key: key, credential_value: 'mock-' + key })),
     phone_numbers: [{ id: 'number', company_id: 'company-1', number_type: 'shared_acquisition_automation', number: '+15555550100', provider: 'twilio', registration_status: 'registered', is_active: true, ...options }],
-    contacts: [], conversations: [], calls: [], call_recordings: [],
+    contacts: [], conversations: [], calls: [], call_recordings: [], notifications: [],
   };
   const writes = [];
   const db = {
     auth: { getUser: async () => ({ data: { user: { id: authId } } }) },
     from(table) {
-      let filters = [], single = false, count = Infinity, inserted;
+      let filters = [], single = false, count = Infinity, inserted, updated;
       const q = {
         select() { return q; }, eq(key, value) { filters.push((row) => row[key] === value); return q; },
         in(key, values) { filters.push((row) => values.includes(row[key])); return q; },
         not(key, _operator, value) { filters.push((row) => (row[key] ?? null) !== value); return q; },
         limit(value) { count = value; return q; }, maybeSingle() { single = true; return q; }, single() { single = true; return q; },
         insert(row) { inserted = { id: 'mock-created', ...row }; writes.push({ table, row }); return q; },
+        update(row) { updated = row; return q; },
+        upsert(row, options) {
+          assert.equal(options.ignoreDuplicates,true);
+          const keys=options.onConflict.split(',');
+          if (!rows[table].some(existing=>keys.every(key=>existing[key]===row[key]))) {
+            rows[table].push({id:'event-'+rows[table].length,is_read:false,...row}); writes.push({table,row});
+          }
+          return q;
+        },
         then(resolve, reject) {
           const data = inserted ? [inserted] : (rows[table] ?? []).filter((row) => filters.every((filter) => filter(row))).slice(0, count);
+          if(updated) data.forEach(row=>Object.assign(row,updated));
           return Promise.resolve({ data: single ? data[0] ?? null : data, error: null }).then(resolve, reject);
         },
       };
@@ -149,4 +159,26 @@ test('more than ten eligible members fails explicitly instead of silently exclud
     f.rows.user_roles.push({ user_id: 'extra-' + i, role_id: 'receiver' });
   }
   await assert.rejects(() => f.routing.getInboundRecipients(f.db, 'company-1', { number_type: 'shared_acquisition_automation' }), /ten-recipient/);
+});
+
+for (const status of ['ringing','initiated','in-progress']) test(`intermediate ${status} callback does not create missed-call notifications`,async()=>{
+  const f=fixture();
+  f.rows.calls.push({id:'call-1',call_sid:'CA1',company_id:'company-1',direction:'inbound',phone_number_id:'number',status:'ringing'});
+  const response=await f.routing.handleInboundStatusCallback(new Request('https://mock.supabase.co/functions/v1/voice-token',{
+    method:'POST',headers:{'x-twilio-signature':'valid','Content-Type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({CallSid:'CA1',DialCallStatus:status,AccountSid:'mock-account_sid'}),
+  }));
+  assert.equal(response.status,200); assert.equal(f.rows.notifications.length,0); assert.equal(f.rows.calls[0].status,'ringing');
+});
+test('repeated missed-call callbacks preserve the unique event and its persisted read state',async()=>{
+  const f=fixture('user-a',{assigned_user_id:'user-a'});
+  f.rows.calls.push({id:'call-1',call_sid:'CA1',company_id:'company-1',direction:'inbound',phone_number_id:'number',from_number:'+15555550100',answered_at:null});
+  const callback=()=>f.routing.handleInboundStatusCallback(new Request('https://mock.supabase.co/functions/v1/voice-token',{
+    method:'POST',headers:{'x-twilio-signature':'valid','Content-Type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({CallSid:'CA1',DialCallStatus:'no-answer',AccountSid:'mock-account_sid'}),
+  }));
+  assert.equal((await callback()).status,200); assert.equal(f.rows.notifications.length,1);
+  f.rows.notifications[0].is_read=true;
+  await Promise.all([callback(),callback()]);
+  assert.equal(f.rows.notifications.length,1);assert.equal(f.rows.notifications[0].is_read,true);
 });

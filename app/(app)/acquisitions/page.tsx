@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/lib/supabase/client';
 import { triggerAutomation } from '@/lib/utils/automation';
 import { createPipelineOpportunity, movePipelineStage } from '@/lib/utils/pipeline-stage';
@@ -24,13 +24,16 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { AcquisitionDrawer } from '@/components/acquisition-drawer';
 import { StageMoveDialog } from '@/components/stage-move-dialog';
 import { DuplicateReviewDialog } from '@/components/duplicate-review-dialog';
-import { ImportTextWizard, ActiveCampaignIndicator } from '@/components/import-text-wizard';
+import { ActiveCampaignIndicator } from '@/components/import-text-wizard';
 import {
   Search, Plus, User, MapPin, Clock, AlertCircle, ChevronUp, ChevronDown,
   Filter, Save, Star, Phone, X, TrendingUp, Upload, MessageSquareMore,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import Link from 'next/link';
+import { LeadImportDialog } from '@/components/lead-import-dialog';
+import { LeadGroupPicker } from '@/components/lead-group-picker';
+import { toast } from 'sonner';
 
 type SortField = 'seller_name' | 'property_address' | 'priority' | 'stage_entered_at' | 'last_contacted_at' | 'potential_revenue';
 type SortDir = 'asc' | 'desc';
@@ -58,9 +61,26 @@ export default function AcquisitionsPage() {
   const [opportunitiesMap, setOpportunitiesMap] = useState<Record<string, Opportunity>>({});
   const [tasksMap, setTasksMap] = useState<Record<string, Task>>({});
   const [users, setUsers] = useState<{ id: string; full_name: string }[]>([]);
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [leadSources, setLeadSources] = useState<string[]>([]);
+  const [motivationTypes, setMotivationTypes] = useState<string[]>([]);
+  const [group, setGroup] = useState('all');
+  const [batch, setBatch] = useState('all');
+  const [tag, setTag] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [groups, setGroups] = useState<{id:string;name:string}[]>([]);
+  const [batches, setBatches] = useState<{id:string;name:string;created_at:string;lead_count:number}[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkTag, setBulkTag] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  useEffect(() => { const timer = setTimeout(() => setDebouncedSearch(search), 250); return () => clearTimeout(timer); }, [search]);
   const [loading, setLoading] = useState(true);
   const [moveError, setMoveError] = useState('');
-  const [search, setSearch] = useState('');
+
   const [sortField, setSortField] = useState<SortField>('stage_entered_at');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [filterStage, setFilterStage] = useState<string>('all');
@@ -105,33 +125,26 @@ export default function AcquisitionsPage() {
     if (stagesRes.error) throw stagesRes.error;
     if (usersRes.error) throw usersRes.error;
 
-    // Paginate through all records
-    let allRecords: AcquisitionRecord[] = [];
-    let offset = 0;
-    let hasMore = true;
-    while (hasMore) {
-      let recordsQuery = supabase
-        .from('acquisition_records')
-        .select('*')
-        .eq('company_id', companyId)
-        .is('archived_at', null)
-        .order('id')
-        .range(offset, offset + FETCH_PAGE_SIZE - 1);
-      if (!canViewAllLeads && profile?.id) {
-        const newLeadStageId = (stagesRes.data ?? []).find((stage) => stage.stage_key === 'new_lead')?.id;
-        const visibilityFilter = newLeadStageId
-          ? `assigned_user_id.eq.${profile.id},and(assigned_user_id.is.null,pipeline_stage_id.eq.${newLeadStageId})`
-          : `assigned_user_id.eq.${profile.id}`;
-        recordsQuery = recordsQuery.or(visibilityFilter);
-      }
-      const { data, error } = await recordsQuery.abortSignal(signal);
-      if (signal.aborted) return;
-      if (error) throw error;
-      const batch = (data ?? []) as AcquisitionRecord[];
-      allRecords = allRecords.concat(batch);
-      hasMore = batch.length === FETCH_PAGE_SIZE;
-      offset += FETCH_PAGE_SIZE;
-    }
+    const result = await supabase.rpc('search_acquisition_leads', {
+      p_filters: { search: debouncedSearch, stage: filterStage, assigned: filterAssigned, source: filterLeadSource, motivation: filterMotivation, group, batch, tag,
+        from: dateFrom ? new Date(`${dateFrom}T00:00:00`).toISOString() : '',
+        to: dateTo ? new Date(new Date(`${dateTo}T00:00:00`).setDate(new Date(`${dateTo}T00:00:00`).getDate()+1)).toISOString() : '' },
+      p_page: page, p_sort: sortField, p_direction: sortDir,
+    }).abortSignal(signal);
+    if (signal.aborted) return;
+    if (result.error) throw result.error;
+    const allRecords = (result.data?.records ?? []) as AcquisitionRecord[];
+    setTotal(result.data?.total ?? 0);
+    setLeadSources(result.data?.sources ?? []);
+    setMotivationTypes(result.data?.motivations ?? []);
+    const [groupResult, batchResult] = await Promise.all([
+      supabase.from('lead_groups').select('id,name').eq('company_id',companyId).order('name').abortSignal(signal),
+      supabase.from('acquisition_import_batches').select('id,name,created_at,lead_count').eq('company_id',companyId).order('created_at',{ascending:false}).limit(100).abortSignal(signal),
+    ]);
+    if (signal.aborted) return;
+    if (groupResult.error) throw groupResult.error;
+    if (batchResult.error) throw batchResult.error;
+    setGroups(groupResult.data ?? []); setBatches(batchResult.data ?? []);
 
     const contactIds = Array.from(new Set(allRecords.map((r) => r.contact_id).filter(Boolean))) as string[];
     const propertyIds = Array.from(new Set(allRecords.map((r) => r.property_id).filter(Boolean))) as string[];
@@ -227,7 +240,7 @@ export default function AcquisitionsPage() {
     } finally {
       if (!signal.aborted) setLoading(false);
     }
-  }, [canViewAllLeads, companyId, profile?.id]);
+  }, [canViewAllLeads, companyId, page, sortField, sortDir, debouncedSearch, filterStage, filterAssigned, filterLeadSource, filterMotivation, group, batch, tag, dateFrom, dateTo]);
 
   useEffect(() => {
     setRecords([]);
@@ -243,77 +256,19 @@ export default function AcquisitionsPage() {
     return () => loadController.current?.abort();
   }, [load]);
 
-  const filteredRecords = useMemo(() => records.filter((r) => {
-    if (filterStage !== 'all' && r.pipeline_stage_id !== filterStage) return false;
-    if (filterAssigned === 'unassigned' && r.assigned_user_id) return false;
-    if (filterAssigned === 'mine' && r.assigned_user_id !== profile?.id) return false;
-    else if (filterAssigned !== 'all' && filterAssigned !== 'unassigned' && filterAssigned !== 'mine' && r.assigned_user_id !== filterAssigned) return false;
-    if (filterLeadSource !== 'all' && r.lead_source !== filterLeadSource) return false;
-    if (filterMotivation !== 'all' && (r.motivation ?? '').toLowerCase() !== filterMotivation.toLowerCase()) return false;
-    if (search) {
-      const c = r.contact_id ? contactsMap[r.contact_id] : null;
-      const p = r.property_id ? propertiesMap[r.property_id] : null;
-      const name = c ? `${c.first_name ?? ''} ${c.last_name ?? ''}`.toLowerCase() : '';
-      const addr = p ? p.street_address?.toLowerCase() ?? '' : '';
-      const city = p ? (p.city ?? '').toLowerCase() : '';
-      const state = p ? (p.state ?? '').toLowerCase() : '';
-      const phone = c ? (c.primary_phone ?? '').replace(/\D/g, '') : '';
-      const lower = search.toLowerCase();
-      const searchDigits = lower.replace(/\D/g, '');
-      const phoneMatch = searchDigits.length >= 3 && phone.includes(searchDigits);
-      if (!name.includes(lower) && !addr.includes(lower) && !city.includes(lower) && !state.includes(lower) && !(r.motivation ?? '').toLowerCase().includes(lower) && !phoneMatch) return false;
-    }
-    return true;
-  }), [records, filterStage, filterAssigned, filterLeadSource, filterMotivation, profile?.id, search, contactsMap, propertiesMap]);
+  const sortedRecords = records;
+  const filteredRecords = records;
+  useEffect(() => { setPage(0); setSelected([]); }, [debouncedSearch, filterStage, filterAssigned, filterLeadSource, filterMotivation, group, batch, tag, dateFrom, dateTo, sortField, sortDir]);
+  const bulkEdit = async (action: string, value: string) => {
+    if (!selected.length || bulkBusy) return;
+    setBulkBusy(true);
+    const result = await supabase.rpc('bulk_edit_acquisition_leads', { p_ids: selected, p_action: action, p_value: value });
+    setBulkBusy(false);
+    if (result.error) { toast.error(result.error.message); return; }
+    toast.success(`${result.data} leads updated`); setSelected([]); window.dispatchEvent(new Event('crm:changed')); void load(false);
+  };
 
-  const sortedRecords = useMemo(() => [...filteredRecords].sort((a, b) => {
-    let cmp = 0;
-    switch (sortField) {
-      case 'seller_name': {
-        const aName = a.contact_id ? contactsMap[a.contact_id]?.first_name ?? '' : '';
-        const bName = b.contact_id ? contactsMap[b.contact_id]?.first_name ?? '' : '';
-        cmp = aName.localeCompare(bName);
-        break;
-      }
-      case 'property_address': {
-        const aAddr = a.property_id ? propertiesMap[a.property_id]?.street_address ?? '' : '';
-        const bAddr = b.property_id ? propertiesMap[b.property_id]?.street_address ?? '' : '';
-        cmp = aAddr.localeCompare(bAddr);
-        break;
-      }
-      case 'priority': {
-        const order = ['urgent', 'high', 'medium', 'low'];
-        cmp = order.indexOf(a.priority) - order.indexOf(b.priority);
-        break;
-      }
-      case 'stage_entered_at':
-        cmp = new Date(a.stage_entered_at).getTime() - new Date(b.stage_entered_at).getTime();
-        break;
-      case 'last_contacted_at':
-        cmp = new Date(a.last_contacted_at ?? 0).getTime() - new Date(b.last_contacted_at ?? 0).getTime();
-        break;
-      case 'potential_revenue': {
-        const aOpp = a.opportunity_id ? opportunitiesMap[a.opportunity_id] : null;
-        const bOpp = b.opportunity_id ? opportunitiesMap[b.opportunity_id] : null;
-        cmp = (aOpp?.expected_revenue ?? 0) - (bOpp?.expected_revenue ?? 0);
-        break;
-      }
-    }
-    return sortDir === 'asc' ? cmp : -cmp;
-  }), [filteredRecords, sortField, sortDir, contactsMap, propertiesMap, opportunitiesMap]);
-
-  const groupedRecords = useMemo(() => {
-    const groups = new Map<string, AcquisitionRecord[]>();
-    for (const record of sortedRecords) {
-      const key = record.pipeline_stage_id;
-      if (!key) continue;
-      const group = groups.get(key);
-      if (group) group.push(record);
-      else groups.set(key, [record]);
-    }
-    return groups;
-  }, [sortedRecords]);
-  const recordsByStage = (stageId: string) => groupedRecords.get(stageId) ?? [];
+  const recordsByStage = (stageId: string) => sortedRecords.filter((r) => r.pipeline_stage_id === stageId);
 
   const handleDragStart = (e: React.DragEvent, recordId: string) => {
     e.dataTransfer.setData('text/plain', recordId);
@@ -429,8 +384,6 @@ export default function AcquisitionsPage() {
     setActiveViewId(viewId);
   };
 
-  const leadSources = Array.from(new Set(records.map((r) => r.lead_source).filter(Boolean))) as string[];
-  const motivationTypes = Array.from(new Set(records.map((r) => r.motivation).filter(Boolean))).sort() as string[];
 
   const toggleSort = (field: SortField) => {
     if (sortField === field) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
@@ -501,24 +454,36 @@ export default function AcquisitionsPage() {
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name, address, phone..." className="pl-9 h-9" />
         </div>
-        <select aria-label="Stage" value={filterStage} onChange={(event) => setFilterStage(event.target.value)} className="h-9 w-[140px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
-          <option value="all">All stages</option>
-          {stages.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-        </select>
-        <select aria-label="Assignment" value={filterAssigned} onChange={(event) => setFilterAssigned(event.target.value)} className="h-9 w-[160px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
-          <option value="all">All assignments</option>
-          <option value="mine">Assigned to me</option>
-          <option value="unassigned">Unassigned</option>
-          {users.map((u) => <option key={u.id} value={u.id}>{u.full_name}</option>)}
-        </select>
-        <select aria-label="Lead source" value={filterLeadSource} onChange={(event) => setFilterLeadSource(event.target.value)} className="h-9 w-[140px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
-          <option value="all">All sources</option>
-          {leadSources.map((s) => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <select aria-label="Motivation" value={filterMotivation} onChange={(event) => setFilterMotivation(event.target.value)} className="h-9 w-[160px] rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
-          <option value="all">All motivations</option>
-          {motivationTypes.map((m) => <option key={m} value={m}>{m}</option>)}
-        </select>
+        <Select value={filterStage} onValueChange={setFilterStage}>
+          <SelectTrigger className="w-[140px] h-9"><SelectValue placeholder="All stages" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All stages</SelectItem>
+            {stages.map((s) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={filterAssigned} onValueChange={setFilterAssigned}>
+          <SelectTrigger className="w-[140px] h-9"><SelectValue placeholder="Assignment" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All assignments</SelectItem>
+            <SelectItem value="mine">Assigned to me</SelectItem>
+            <SelectItem value="unassigned">Unassigned</SelectItem>
+            {users.map((u) => <SelectItem key={u.id} value={u.id}>{u.full_name}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={filterLeadSource} onValueChange={setFilterLeadSource}>
+          <SelectTrigger className="w-[140px] h-9"><SelectValue placeholder="Lead source" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All sources</SelectItem>
+            {leadSources.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={filterMotivation} onValueChange={setFilterMotivation}>
+          <SelectTrigger className="w-[160px] h-9"><SelectValue placeholder="Motivation" /></SelectTrigger>
+          <SelectContent className="max-h-64">
+            <SelectItem value="all">All motivations</SelectItem>
+            {motivationTypes.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
+          </SelectContent>
+        </Select>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="outline" size="sm" className="h-9 gap-1.5">
@@ -541,6 +506,26 @@ export default function AcquisitionsPage() {
         </Button>
       </div>
 
+      <div className="flex flex-wrap gap-2 px-4 items-center">
+        <select aria-label="Filter by group" className="h-9 rounded border bg-background px-2 text-sm" value={group} onChange={(e) => setGroup(e.target.value)}><option value="all">All groups</option><option value="none">No group</option>{groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}</select>
+        <select aria-label="Filter by import batch" className="h-9 rounded border bg-background px-2 text-sm max-w-[240px]" value={batch} onChange={(e) => setBatch(e.target.value)}><option value="all">All import batches</option>{batches.map((b) => <option key={b.id} value={b.id}>{b.name} · {formatDate(b.created_at)} · {b.lead_count} leads</option>)}</select>
+        <Input aria-label="Filter by tag" placeholder="Tag" className="w-32 h-9" value={tag} onChange={(e) => setTag(e.target.value)} />
+        <label className="text-xs">Added from <Input type="date" className="w-36 h-9" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></label>
+        <label className="text-xs">Added through <Input type="date" className="w-36 h-9" value={dateTo} onChange={(e) => setDateTo(e.target.value)} /></label>
+      </div>
+      {canEdit && <div className="flex flex-wrap gap-2 px-4 items-center text-xs">
+        <Button variant="outline" size="sm" onClick={() => setSelected(selected.length ? [] : records.map((r) => r.id))}>{selected.length ? 'Clear selection' : 'Select page'}</Button>
+        <span>{selected.length} selected</span>
+        {!!selected.length && <>
+          <select aria-label="Move selected leads to group" disabled={bulkBusy} className="h-8 border rounded bg-background" value="" onChange={(e) => void bulkEdit('group',e.target.value === 'none' ? '' : e.target.value)}><option value="" disabled>Move to group…</option><option value="none">No group</option>{groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}</select>
+          {hasPermission('assign_leads') && <select aria-label="Assign selected leads" disabled={bulkBusy} className="h-8 border rounded bg-background" value="" onChange={(e) => void bulkEdit('assign',e.target.value === 'none' ? '' : e.target.value)}><option value="" disabled>Assign manager…</option><option value="none">Unassigned</option>{users.map((u) => <option key={u.id} value={u.id}>{u.full_name}</option>)}</select>}
+          <Input className="w-32 h-8" aria-label="Tag to apply" placeholder="Tag to apply" value={bulkTag} onChange={(e) => setBulkTag(e.target.value)} /><Button size="sm" disabled={bulkBusy || !bulkTag.trim()} onClick={() => void bulkEdit('tag',bulkTag)}>Apply tag</Button>
+        </>}
+      </div>}
+      <div className="flex gap-3 items-center justify-between px-4 text-xs text-muted-foreground">
+        <span>{total} matching leads · Page {page + 1} of {Math.max(1,Math.ceil(total/100))}. Stage counts below are for this page.</span>
+        <div className="flex gap-2"><Button size="sm" variant="outline" disabled={page===0 || loading} onClick={() => { setSelected([]); setPage(page-1); }}>Previous</Button><Button size="sm" variant="outline" disabled={(page+1)*100>=total || loading} onClick={() => { setSelected([]); setPage(page+1); }}>Next</Button></div>
+      </div>
       {/* Kanban board */}
       {loading ? (
         <div className="flex items-center justify-center flex-1 text-muted-foreground">Loading pipeline...</div>
@@ -585,6 +570,7 @@ export default function AcquisitionsPage() {
                           className="group rounded-lg border bg-card p-3 cursor-pointer transition-all hover:shadow-md hover:border-primary/30"
                         >
                           <div className="flex items-start justify-between gap-2">
+                            {canEdit && <input type="checkbox" aria-label="Select lead" checked={selected.includes(record.id)} onClick={(e) => e.stopPropagation()} onChange={(e) => setSelected((old) => e.target.checked ? [...old,record.id] : old.filter((id) => id !== record.id))} />}
                             <div className="min-w-0 flex-1">
                               <p className="text-sm font-medium truncate">
                                 {contact ? `${contact.first_name ?? ''} ${contact.last_name ?? ''}`.trim() || contact.company_name || 'Unknown' : 'Unknown'}
@@ -663,13 +649,7 @@ export default function AcquisitionsPage() {
       )}
 
       {/* Import + Text wizard */}
-      {companyId && (
-        <ImportTextWizard
-          open={showImportText}
-          onClose={() => setShowImportText(false)}
-          companyId={companyId}
-        />
-      )}
+      {companyId && showImportText && <LeadImportDialog companyId={companyId} onClose={() => setShowImportText(false)} onComplete={() => void load(false)} />}
 
       {/* Drawer */}
       {drawerRecordId && companyId && (
@@ -763,6 +743,7 @@ function CreateAcquisitionDialog({
   const [propertyType, setPropertyType] = useState('');
   const [recentlyPurchased, setRecentlyPurchased] = useState('');
   const [leadId, setLeadId] = useState('');
+  const [groupId, setGroupId] = useState('');
 
   useEffect(() => {
     if (!canCreateDisposition) return;
@@ -799,7 +780,10 @@ function CreateAcquisitionDialog({
   };
 
   const create = async () => {
-    if (!validate()) return;
+    if (saving || !validate()) return;
+    if (![firstName,lastName,phone,email].some((value) => value.trim())) { setSaveError('Provide a seller name, phone number, or email.'); return; }
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setSaveError('Enter a valid email.'); return; }
+    if (phone && phone.replace(/\D/g,'').length < 10) { setSaveError('Enter a valid phone number.'); return; }
     setSaving(true);
     setSaveError('');
     if (!stageId) {
@@ -824,6 +808,7 @@ function CreateAcquisitionDialog({
         },
         details: {
           created_at: createdDate ? new Date(`${createdDate}T12:00:00`).toISOString() : undefined,
+          group_id: pipeline === 'acquisition' ? groupId || null : undefined,
           lead_source: sourceChannel,
           motivation,
           priority: 'medium',
@@ -856,10 +841,11 @@ function CreateAcquisitionDialog({
   const fieldClass = (name: string) => cn(errors[name] && 'border-red-500 ring-1 ring-red-500/30');
 
   return (
-    <Dialog open onOpenChange={onClose}>
+    <Dialog open onOpenChange={(open) => { if (!open && !saving) onClose(); }}>
       <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
         <DialogHeader><DialogTitle>New Opportunity</DialogTitle></DialogHeader>
         <div className="space-y-4 py-2">
+          {pipeline === 'acquisition' && <LeadGroupPicker companyId={companyId} value={groupId} onChange={setGroupId} />}
           {saveError && <p className="text-sm text-destructive">{saveError}</p>}
           <div className="grid grid-cols-2 gap-4 rounded-lg border bg-muted/20 p-3">
             <div className="space-y-1.5">

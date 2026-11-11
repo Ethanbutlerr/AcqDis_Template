@@ -30,7 +30,7 @@ export function PermissionGate({
   if (!allowed) {
     return (
       <>
-        {fallback ?? (
+        {fallback !== undefined ? fallback : (
           <Card>
             <CardContent className="flex flex-col items-center justify-center py-12 text-center">
               <ShieldX className="h-8 w-8 text-muted-foreground mb-2" />

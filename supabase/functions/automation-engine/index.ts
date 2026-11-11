@@ -1,3 +1,4 @@
+// @ts-nocheck
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const corsHeaders = {
@@ -967,7 +968,7 @@ async function createNotificationIdempotent(supabase: any, params: {
 
   if (existing) return;
 
-  await supabase.from("notifications").insert({
+  const { error } = await supabase.from("notifications").upsert({
     company_id: params.company_id,
     user_id: params.user_id,
     type: params.type,
@@ -976,7 +977,9 @@ async function createNotificationIdempotent(supabase: any, params: {
     entity_type: params.entity_type,
     entity_id: params.entity_id,
     is_read: false,
-  });
+    event_key: `automation:${params.idempotency_key}`,
+  }, { onConflict: "company_id,user_id,event_key", ignoreDuplicates: true });
+  if (error) throw error;
 }
 
 async function queueMockEvent(supabase: any, params: {

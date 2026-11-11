@@ -19,7 +19,7 @@ export default function LoginPage() {
 }
 
 function LoginContent() {
-  const { signIn, user, profile, loading: authLoading } = useAuth();
+  const { signIn, user, profile, authError, refreshProfile, loading: authLoading } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -45,13 +45,13 @@ function LoginContent() {
     setError(null);
     setLoading(true);
 
-    const { error: signInError } = await signIn(email, password);
-
-    if (signInError) {
+    try {
+      const { error: signInError } = await signIn(email, password);
       setError(signInError);
+    } catch {
+      setError('Unable to sign in. Please check your connection and retry.');
+    } finally {
       setLoading(false);
-    } else {
-      setRedirecting(true);
     }
   };
 
@@ -78,14 +78,21 @@ function LoginContent() {
       {noProfileError && (
         <div className="flex items-center gap-2 rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 text-sm text-destructive">
           <AlertCircle className="h-4 w-4 shrink-0" />
-          <span>Account setup incomplete. Please sign up again or contact support.</span>
+          <span>Your account profile is unavailable. Contact your administrator.</span>
         </div>
       )}
-      {error && (
+      {(error || authError) && (
         <div className="flex items-center gap-2 rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 text-sm text-destructive">
           <AlertCircle className="h-4 w-4 shrink-0" />
-          <span>{error}</span>
+          <span role="alert">{error || authError}</span>
         </div>
+      )}
+      {user && !profile && authError && (
+        <Button variant="outline" disabled={loading} onClick={async () => {
+          setError(null);
+          setLoading(true);
+          try { await refreshProfile(); } finally { setLoading(false); }
+        }}>Retry loading account</Button>
       )}
       <form onSubmit={handleSubmit} className="space-y-4">
         <div className="space-y-2">

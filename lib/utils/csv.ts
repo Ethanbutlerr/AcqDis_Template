@@ -14,49 +14,27 @@ export function toCSV(rows: Record<string, unknown>[], headers?: string[]): stri
 }
 
 export function parseCSV(text: string): Record<string, string>[] {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim());
-  if (lines.length === 0) return [];
-
-  const parseLine = (line: string): string[] => {
-    const result: string[] = [];
-    let current = '';
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const char = line[i];
-      if (inQuotes) {
-        if (char === '"') {
-          if (line[i + 1] === '"') {
-            current += '"';
-            i++;
-          } else {
-            inQuotes = false;
-          }
-        } else {
-          current += char;
-        }
-      } else {
-        if (char === '"') {
-          inQuotes = true;
-        } else if (char === ',') {
-          result.push(current);
-          current = '';
-        } else {
-          current += char;
-        }
-      }
-    }
-    result.push(current);
-    return result;
-  };
-
-  const headers = parseLine(lines[0]).map((h) => h.trim());
-  return lines.slice(1).map((line) => {
-    const values = parseLine(line);
-    const row: Record<string, string> = {};
-    headers.forEach((header, i) => {
-      row[header] = (values[i] ?? '').trim();
-    });
-    return row;
+  const records: string[][] = [];
+  let row: string[] = [], value = '', quoted = false;
+  const input = text.replace(/^\uFEFF/, '');
+  const endRow = () => { row.push(value); if (row.some((v) => v.trim())) records.push(row); row = []; value = ''; };
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i];
+    if (char === '"') {
+      if (quoted && input[i + 1] === '"') { value += '"'; i++; }
+      else quoted = !quoted;
+    } else if (char === ',' && !quoted) { row.push(value); value = ''; }
+    else if ((char === '\n' || char === '\r') && !quoted) { if (char === '\r' && input[i+1] === '\n') i++; endRow(); }
+    else value += char;
+  }
+  if (quoted) throw new Error('CSV has an unterminated quoted field.');
+  if (value || row.length) endRow();
+  if (!records.length) return [];
+  const headers = records[0].map((h) => h.trim());
+  if (headers.some((h) => !h) || new Set(headers).size !== headers.length) throw new Error('CSV headers must be nonempty and unique.');
+  return records.slice(1).map((values, index) => {
+    if (values.length > headers.length) throw new Error(`CSV row ${index + 2} has more fields than headers.`);
+    return Object.fromEntries(headers.map((header, i) => [header, (values[i] ?? '').trim()]));
   });
 }
 
