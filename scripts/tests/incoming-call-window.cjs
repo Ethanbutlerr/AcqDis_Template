@@ -50,6 +50,12 @@ class MockDevice extends EventEmitter {
       this.emit('unregistered');
       throw undefined; // Twilio's register() rejects without a value on this event.
     }
+    if (registerError === 'invalid_token') {
+      this.state = 'unregistered';
+      this.emit('error', { code: 20101, message: 'AccessTokenInvalid (20101)' });
+      this.emit('unregistered');
+      throw undefined;
+    }
     if (registerError) throw new Error('Mock registration failed');
     this.state = 'registered'; this.emit('registered');
   }
@@ -59,6 +65,7 @@ class MockDevice extends EventEmitter {
 const supabase = {
   functions: { invoke: async (_name, { body }) => {
     tokens.push(body);
+    if (body.action === 'repair_browser_key') { registerError = false; return { data: { success: true } }; }
     if (tokenGate) return await tokenGate;
     return { data: { token: `${body.company_id}:${body.user_id}` } };
   } },
@@ -96,7 +103,7 @@ for (const extension of ['.ts', '.tsx']) Module._extensions[extension] = (module
   }).outputText, filename);
 };
 const { IncomingCallListener } = require('../../components/incoming-call-listener.tsx');
-const user = (id, allowed = true, company = 'company-1') => ({ profile: { id, company_id: company }, permissions: allowed ? ['receive_calls'] : ['view_calls'] });
+const user = (id, allowed = true, company = 'company-1') => ({ profile: { id, company_id: company, is_agency_admin: true }, permissions: allowed ? ['receive_calls'] : ['view_calls'] });
 async function flush() { await act(async () => new Promise((resolve) => setTimeout(resolve, 5))); }
 function reset() {
   devices = []; tokens = []; updates = []; roots = []; activeNumber = true; tokenGate = null; registerError = false;
@@ -216,6 +223,14 @@ test('an undefined registration rejection preserves the Twilio signaling error',
   await click('Reconnect calling');
   assert.match(document.body.textContent, /Signaling connection closed \(Twilio 31005\)/);
   registerError = false; await click('Reconnect calling');
+  assert.match(document.body.textContent, /No incoming calls/);
+});
+test('an administrator repairs a rejected Twilio access token and receives a new one', async () => {
+  reset(); registerError = 'invalid_token'; await mount(); await click('Open incoming calls');
+  assert.match(document.body.textContent, /AccessTokenInvalid \(20101\)/);
+  await click('Repair browser calling key');
+  assert.equal(tokens.filter((request) => request.action === 'repair_browser_key').length, 1);
+  assert.equal(tokens.filter((request) => request.action === 'get_token').length, 2);
   assert.match(document.body.textContent, /No incoming calls/);
 });
 test('no configured number is unavailable, not empty', async () => {

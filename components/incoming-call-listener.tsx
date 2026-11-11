@@ -26,6 +26,11 @@ function needsFreshToken(error: unknown): boolean {
   return [31202, 31203, 31204, 31205].includes(value?.twilioError?.code ?? value?.code ?? 0);
 }
 
+function needsBrowserKeyRepair(error: unknown): boolean {
+  const value = error as { code?: number; twilioError?: { code?: number } } | null;
+  return [20101, 31202, 31203].includes(value?.twilioError?.code ?? value?.code ?? 0);
+}
+
 export function IncomingCallListener() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
@@ -40,6 +45,8 @@ export function IncomingCallListener() {
   const [elapsed, setElapsed] = useState(0);
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [repairNeeded, setRepairNeeded] = useState(false);
+  const [repairing, setRepairing] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const callRef = useRef<Call | null>(null);
   const answeringRef = useRef(false);
@@ -154,6 +161,7 @@ export function IncomingCallListener() {
     scopeRef.current = scope;
     clearIncomingCall();
     deviceErrorRef.current = null;
+    setRepairNeeded(false);
     setIncomingStatus('ringing');
     setError(null);
     setDeviceStatus(canReceiveCalls ? 'checking' : 'unavailable');
@@ -184,12 +192,13 @@ export function IncomingCallListener() {
         freshTokenRequiredRef.current = false;
         registeredDevice.on('incoming', (call) => { if (current()) handleIncoming(call); });
         registeredDevice.on('registered', () => {
-          if (current()) { deviceErrorRef.current = null; setDeviceStatus('ready'); setError(null); }
+          if (current()) { deviceErrorRef.current = null; setRepairNeeded(false); setDeviceStatus('ready'); setError(null); }
         });
         registeredDevice.on('unregistered', () => { if (current()) setDeviceStatus('unavailable'); });
         registeredDevice.on('error', (deviceError) => {
           if (!current()) return;
           deviceErrorRef.current = deviceError;
+          setRepairNeeded(needsBrowserKeyRepair(deviceError));
           if (needsFreshToken(deviceError)) freshTokenRequiredRef.current = true;
           setError(callingError(deviceError));
           setDeviceStatus('error');
@@ -213,6 +222,7 @@ export function IncomingCallListener() {
         // Twilio's register() promise rejects with no value on an
         // 'unregistered' event. Keep the error from the preceding SDK event.
         setError(callingError(setupError ?? deviceErrorRef.current));
+        setRepairNeeded(needsBrowserKeyRepair(setupError ?? deviceErrorRef.current));
         setDeviceStatus('error');
       }
     }
@@ -234,15 +244,39 @@ export function IncomingCallListener() {
       // registration's audio setup to begin in a user gesture.
       setError(null);
       deviceErrorRef.current = null;
+      setRepairNeeded(false);
       setDeviceStatus('checking');
       void device.register().catch((registerError) => {
         if (deviceRef.current !== device) return;
         setError(callingError(registerError ?? deviceErrorRef.current));
+        setRepairNeeded(needsBrowserKeyRepair(registerError ?? deviceErrorRef.current));
         setDeviceStatus('error');
       });
       return;
     }
     setRetry((value) => value + 1);
+  };
+
+  const repairBrowserCalling = async () => {
+    if (!profile?.company_id || !profile.id || !profile.is_agency_admin || repairing) return;
+    setRepairing(true);
+    setError(null);
+    try {
+      const { data, error: repairError } = await supabase.functions.invoke('voice-token', {
+        body: { action: 'repair_browser_key', company_id: profile.company_id, user_id: profile.id },
+      });
+      if (repairError || !data?.success) {
+        setError(data?.error || repairError?.message || 'Unable to repair browser calling.');
+        return;
+      }
+      setRepairNeeded(false);
+      setDeviceStatus('checking');
+      setRetry((value) => value + 1);
+    } catch (repairError) {
+      setError(callingError(repairError));
+    } finally {
+      setRepairing(false);
+    }
   };
 
   if (!canReceiveCalls) return null;
@@ -305,6 +339,11 @@ export function IncomingCallListener() {
           <p role="status" className="text-sm">{deviceStatus === 'ready' ? 'No incoming calls' : statusLabel}</p>
           {incomingStatus === 'ended' && <p className="text-xs text-muted-foreground">Call ended or answered elsewhere.</p>}
           {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+          {repairNeeded && (profile?.is_agency_admin
+            ? <Button variant="outline" disabled={repairing} onClick={repairBrowserCalling}>
+                {repairing && <Loader2 className="h-4 w-4 animate-spin mr-1" />}Repair browser calling key
+              </Button>
+            : <p className="text-xs text-muted-foreground">Ask an administrator to repair the Twilio browser calling key.</p>)}
           {(deviceStatus === 'error' || deviceStatus === 'unavailable') &&
             <Button variant="outline" onClick={reconnectCalling}>Reconnect calling</Button>}
         </div> : <div className="flex flex-col items-center gap-4 py-4">

@@ -576,7 +576,7 @@ Deno.serve(async (req: Request) => {
     };
 
     // Resolve company Twilio credentials
-    const requiredPermission = ["sync_numbers", "configure_inbound"].includes(action)
+    const requiredPermission = ["sync_numbers", "configure_inbound", "repair_browser_key"].includes(action)
       ? "manage_phone_numbers"
       : action === "get_token"
         ? ["make_calls", "receive_calls"]
@@ -600,6 +600,54 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({ error: "Twilio credentials not configured. Go to Settings > Integrations and add your Twilio Account SID and Auth Token." }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
+    }
+
+    if (action === "repair_browser_key") {
+      const { data: adminProfile } = await supabase.from("profiles")
+        .select("is_agency_admin")
+        .eq("id", authorizedUser.id)
+        .eq("company_id", company_id)
+        .maybeSingle();
+      if (!adminProfile?.is_agency_admin) {
+        return new Response(JSON.stringify({ error: "Only a company administrator can repair browser calling." }), {
+          status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // A 20101 response means Twilio rejected the key used to sign the
+      // access token. Create a dedicated Standard key on this same account.
+      const keyResponse = await fetch("https://iam.twilio.com/v1/Keys", {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${btoa(`${accountSid}:${authToken}`)}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({ AccountSid: accountSid, FriendlyName: "AcqDis browser calling" }),
+      });
+      if (!keyResponse.ok) {
+        return new Response(JSON.stringify({ error: "Twilio could not create a browser calling key. Check the Account SID and Auth Token in Settings > Integrations." }), {
+          status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const key = await keyResponse.json();
+      if (!/^SK[0-9a-fA-F]{32}$/.test(key.sid ?? "") || !key.secret) {
+        return new Response(JSON.stringify({ error: "Twilio returned an incomplete browser calling key." }), {
+          status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      const { error: saveError } = await supabase.from("company_credentials").upsert([
+        { company_id, provider: "twilio", credential_key: "api_key_sid", credential_value: key.sid },
+        { company_id, provider: "twilio", credential_key: "api_key_secret", credential_value: key.secret },
+      ], { onConflict: "company_id,provider,credential_key" });
+      if (saveError) {
+        console.error("Unable to save replacement Twilio browser key", saveError);
+        return new Response(JSON.stringify({ error: "The replacement Twilio key could not be saved. Please retry." }), {
+          status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     if (action === "get_token") {

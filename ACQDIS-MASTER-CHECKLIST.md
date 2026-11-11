@@ -3,7 +3,8 @@
 ## November 11, 2026 follow-up
 
 - [x] Call Twilio registration directly from “Reconnect calling,” refresh an expired token, and show the Twilio error code if registration fails.
-- [ ] Preserve the live Twilio signaling error when the SDK rejects registration without an error value; identify and resolve its underlying cause.
+- [x] Preserve the live Twilio signaling error when the SDK rejects registration without an error value; identify Twilio 20101 invalid access token as the browser registration failure.
+- [ ] Repair the rejected Twilio API key in production and confirm browser calling registers with a newly issued token.
 - [x] Return all 3,641 matching acquisition leads in the pipeline query and render their stage counts in one board page.
 - [x] Place “Select page” beside “Added through” on the filter row.
 - [x] Verify calling and acquisition changes with 99 tests, lint, type checking, and a production build.
