@@ -1,5 +1,13 @@
 # AcqDis master checklist
 
+## November 11, 2026 follow-up
+
+- [x] Call Twilio registration directly from “Reconnect calling,” refresh an expired token, and show the Twilio error code if registration fails.
+- [x] Return all 3,641 matching acquisition leads in the pipeline query and render their stage counts in one board page.
+- [x] Place “Select page” beside “Added through” on the filter row.
+- [x] Verify calling and acquisition changes with 99 tests, lint, type checking, and a production build.
+- [ ] Confirm the published board and a real browser reconnect after the frontend build completes.
+
 Current state (2026-09-15): the private production backup is complete, the protective migration plus six release migrations are applied and tracked in AcqDis (`rogtagiiqjbmokhxywpd`), and the updated `automation-engine`, `sms-provider`, and `voice-token` Edge Functions are deployed. The application changes are verified locally and await the Git commit/push and controlled live browser checks.
 
 ## 0. Acquisition refresh regression

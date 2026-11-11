@@ -40,10 +40,10 @@ class MockCall extends EventEmitter {
   remote(event) { this.state = event === 'accept' ? 'open' : 'closed'; this.emit(event); }
 }
 class MockDevice extends EventEmitter {
-  registers = 0; destroys = 0; refreshed = [];
+  registers = 0; destroys = 0; refreshed = []; state = 'unregistered';
   constructor(token) { super(); this.token = token; devices.push(this); }
-  async register() { this.registers++; if (registerError) throw new Error('Mock registration failed'); this.emit('registered'); }
-  destroy() { this.destroys++; this.removeAllListeners(); }
+  async register() { this.registers++; if (registerError) throw new Error('Mock registration failed'); this.state = 'registered'; this.emit('registered'); }
+  destroy() { this.destroys++; this.state = 'destroyed'; this.removeAllListeners(); }
   updateToken(token) { this.refreshed.push(token); }
 }
 const supabase = {
@@ -188,8 +188,17 @@ test('disconnected/unavailable state differs from empty; retry is explicit and g
   reset(); registerError = true; await mount(); await click('Open incoming calls');
   assert.match(document.body.textContent, /Calling disconnected/); assert.doesNotMatch(document.body.textContent, /No incoming calls/);
   await click('Close'); await click('Open incoming calls'); assert.equal(devices.length, 1);
-  registerError = false; await click('Reconnect calling'); assert.equal(devices.length, 2); assert.equal(devices[0].destroys, 1);
-  assert.equal(devices[0].listenerCount('incoming'), 0); await click('Open incoming calls'); assert.match(document.body.textContent, /No incoming calls/);
+  registerError = false; await click('Reconnect calling'); assert.equal(devices.length, 1); assert.equal(devices[0].registers, 2);
+  assert.equal(devices[0].destroys, 0); assert.match(document.body.textContent, /No incoming calls/);
+});
+test('Twilio error codes are visible and retry retains the open panel', async () => {
+  reset(); await mount(); await click('Open incoming calls');
+  await act(async () => devices[0].emit('error', {code:31205,message:'Token expired'}));
+  assert.match(document.body.textContent, /Token expired \(Twilio 31205\)/);
+  devices[0].state='unregistered'; await click('Reconnect calling');
+  assert.match(document.body.textContent, /No incoming calls/);
+  assert.equal(devices.length,2); assert.equal(devices[0].destroys,1);
+  assert.equal(devices[1].registers,1);
 });
 test('no configured number is unavailable, not empty', async () => {
   reset(); activeNumber = false; await mount(); await click('Open incoming calls');

@@ -45,7 +45,7 @@ const PRIORITY_COLORS: Record<string, string> = {
   urgent: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
 };
 
-const FETCH_PAGE_SIZE = 1000;
+const FETCH_PAGE_SIZE = 5000;
 
 export default function AcquisitionsPage() {
   const { profile } = useAuth();
@@ -258,6 +258,7 @@ export default function AcquisitionsPage() {
 
   const sortedRecords = records;
   const filteredRecords = records;
+  const selectedIds = new Set(selected);
   useEffect(() => { setPage(0); setSelected([]); }, [debouncedSearch, filterStage, filterAssigned, filterLeadSource, filterMotivation, group, batch, tag, dateFrom, dateTo, sortField, sortDir]);
   const bulkEdit = async (action: string, value: string) => {
     if (!selected.length || bulkBusy) return;
@@ -512,19 +513,19 @@ export default function AcquisitionsPage() {
         <Input aria-label="Filter by tag" placeholder="Tag" className="w-32 h-9" value={tag} onChange={(e) => setTag(e.target.value)} />
         <label className="text-xs">Added from <Input type="date" className="w-36 h-9" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></label>
         <label className="text-xs">Added through <Input type="date" className="w-36 h-9" value={dateTo} onChange={(e) => setDateTo(e.target.value)} /></label>
+        {canEdit && <>
+          <Button variant="outline" size="sm" className="h-9" onClick={() => setSelected(selected.length ? [] : records.map((r) => r.id))}>{selected.length ? 'Clear selection' : 'Select page'}</Button>
+          <span className="text-xs text-muted-foreground whitespace-nowrap">{selected.length} selected</span>
+        </>}
       </div>
-      {canEdit && <div className="flex flex-wrap gap-2 px-4 items-center text-xs">
-        <Button variant="outline" size="sm" onClick={() => setSelected(selected.length ? [] : records.map((r) => r.id))}>{selected.length ? 'Clear selection' : 'Select page'}</Button>
-        <span>{selected.length} selected</span>
-        {!!selected.length && <>
+      {canEdit && !!selected.length && <div className="flex flex-wrap gap-2 px-4 items-center text-xs">
           <select aria-label="Move selected leads to group" disabled={bulkBusy} className="h-8 border rounded bg-background" value="" onChange={(e) => void bulkEdit('group',e.target.value === 'none' ? '' : e.target.value)}><option value="" disabled>Move to group…</option><option value="none">No group</option>{groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}</select>
           {hasPermission('assign_leads') && <select aria-label="Assign selected leads" disabled={bulkBusy} className="h-8 border rounded bg-background" value="" onChange={(e) => void bulkEdit('assign',e.target.value === 'none' ? '' : e.target.value)}><option value="" disabled>Assign manager…</option><option value="none">Unassigned</option>{users.map((u) => <option key={u.id} value={u.id}>{u.full_name}</option>)}</select>}
           <Input className="w-32 h-8" aria-label="Tag to apply" placeholder="Tag to apply" value={bulkTag} onChange={(e) => setBulkTag(e.target.value)} /><Button size="sm" disabled={bulkBusy || !bulkTag.trim()} onClick={() => void bulkEdit('tag',bulkTag)}>Apply tag</Button>
-        </>}
       </div>}
       <div className="flex gap-3 items-center justify-between px-4 text-xs text-muted-foreground">
-        <span>{total} matching leads · Page {page + 1} of {Math.max(1,Math.ceil(total/100))}. Stage counts below are for this page.</span>
-        <div className="flex gap-2"><Button size="sm" variant="outline" disabled={page===0 || loading} onClick={() => { setSelected([]); setPage(page-1); }}>Previous</Button><Button size="sm" variant="outline" disabled={(page+1)*100>=total || loading} onClick={() => { setSelected([]); setPage(page+1); }}>Next</Button></div>
+        <span>{total} matching leads · Showing {records.length} of {total}{total > FETCH_PAGE_SIZE ? ` · Page ${page + 1} of ${Math.ceil(total/FETCH_PAGE_SIZE)}` : ''}</span>
+        {total > FETCH_PAGE_SIZE && <div className="flex gap-2"><Button size="sm" variant="outline" disabled={page===0 || loading} onClick={() => { setSelected([]); setPage(page-1); }}>Previous</Button><Button size="sm" variant="outline" disabled={(page+1)*FETCH_PAGE_SIZE>=total || loading} onClick={() => { setSelected([]); setPage(page+1); }}>Next</Button></div>}
       </div>
       {/* Kanban board */}
       {loading ? (
@@ -568,9 +569,10 @@ export default function AcquisitionsPage() {
                           onDragStart={(e) => handleDragStart(e, record.id)}
                           onClick={() => setDrawerRecordId(record.id)}
                           className="group rounded-lg border bg-card p-3 cursor-pointer transition-all hover:shadow-md hover:border-primary/30"
+                          style={{ contentVisibility: 'auto', containIntrinsicSize: '150px' }}
                         >
                           <div className="flex items-start justify-between gap-2">
-                            {canEdit && <input type="checkbox" aria-label="Select lead" checked={selected.includes(record.id)} onClick={(e) => e.stopPropagation()} onChange={(e) => setSelected((old) => e.target.checked ? [...old,record.id] : old.filter((id) => id !== record.id))} />}
+                            {canEdit && <input type="checkbox" aria-label="Select lead" checked={selectedIds.has(record.id)} onClick={(e) => e.stopPropagation()} onChange={(e) => setSelected((old) => e.target.checked ? [...old,record.id] : old.filter((id) => id !== record.id))} />}
                             <div className="min-w-0 flex-1">
                               <p className="text-sm font-medium truncate">
                                 {contact ? `${contact.first_name ?? ''} ${contact.last_name ?? ''}`.trim() || contact.company_name || 'Unknown' : 'Unknown'}

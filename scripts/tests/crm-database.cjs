@@ -17,7 +17,8 @@ test('CRM migration and actual SQL workflows in isolated PostgreSQL', async (t) 
       CREATE FUNCTION public.has_permission(p text) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT COALESCE(current_setting('test.permissions',true),'') = 'all' OR p = ANY(string_to_array(COALESCE(current_setting('test.permissions',true),''),',')) $$;`);
     await db.exec(fs.readFileSync(path.join(__dirname,'crm-schema-fixture.sql'),'utf8'));
     await db.exec(fs.readFileSync(path.join(__dirname,'crm-policy-fixture.sql'),'utf8'));
-    await db.exec(fs.readFileSync(path.join(root,'supabase/migrations/20261021191550_crm_reliability.sql'),'utf8'));
+    await db.exec(fs.readFileSync(path.join(root,'supabase/migrations/20261111042300_crm_reliability.sql'),'utf8'));
+    await db.exec(fs.readFileSync(path.join(root,'supabase/migrations/20261111133836_acquisition_board_all_leads.sql'),'utf8'));
     await db.exec(`GRANT USAGE ON SCHEMA public,auth TO authenticated; GRANT SELECT,INSERT,UPDATE ON ALL TABLES IN SCHEMA public TO authenticated;
       SELECT set_config('test.user','${id(2)}',false),set_config('test.company','${id(1)}',false),set_config('test.permissions','all',false);
       INSERT INTO companies(id,name) VALUES ('${id(1)}','Test Company'),('${id(9)}','Other Company');
@@ -88,13 +89,13 @@ test('CRM migration and actual SQL workflows in isolated PostgreSQL', async (t) 
       assert.equal(all.managers.find(m=>m.user_id===id(2)).verified_revenue,10000);
       assert.equal(all.managers.find(m=>m.user_id===id(3)).verified_revenue,0);
     });
-    await t.test('server pagination filters and sorts before limiting thousands of rows',async()=>{
+    await t.test('board returns all matching leads and filters before limiting thousands of rows',async()=>{
       await db.exec('RESET ROLE');
-      await query("insert into acquisition_records(company_id,pipeline_stage_id,group_id,lead_source,motivation,created_at) select $1,$2,$3,'Pagination fixture','row '||n,now()-(n||' hours')::interval from generate_series(1,1205) n",[id(1),id(4),groupA]);
+      await query("insert into acquisition_records(company_id,pipeline_stage_id,group_id,lead_source,motivation,created_at) select $1,$2,$3,'Pagination fixture','row '||n,now()-(n||' hours')::interval from generate_series(1,3641) n",[id(1),id(4),groupA]);
       await db.exec('SET ROLE authenticated');
       const page1=(await query('select search_acquisition_leads($1,0) result',[{group:groupA,source:'Pagination fixture'}]))[0].result;
       const page2=(await query('select search_acquisition_leads($1,1) result',[{group:groupA,source:'Pagination fixture'}]))[0].result;
-      assert.equal(page1.total,1205);assert.equal(page1.records.length,100);assert.equal(page2.records.length,100);
+      assert.equal(page1.total,3641);assert.equal(page1.records.length,3641);assert.equal(page2.records.length,0);
       assert.equal(page2.records.some(r=>page1.records.some(first=>first.id===r.id)),false);
     });
     await t.test('dials use actual outbound calls, exclude simulations, and attribute users',async()=>{

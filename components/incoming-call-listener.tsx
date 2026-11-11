@@ -12,6 +12,18 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 type DeviceStatus = 'checking' | 'ready' | 'unavailable' | 'error';
 type IncomingStatus = 'ringing' | 'connecting' | 'connected' | 'ended';
 
+function callingError(error: unknown): string {
+  const value = error as { message?: string; code?: number; twilioError?: { code?: number; message?: string } } | null;
+  const code = value?.twilioError?.code ?? value?.code;
+  const message = value?.twilioError?.message || value?.message || 'Twilio could not connect this browser to calling.';
+  return code ? `${message} (Twilio ${code})` : message;
+}
+
+function needsFreshToken(error: unknown): boolean {
+  const value = error as { code?: number; twilioError?: { code?: number } } | null;
+  return [31202, 31203, 31204, 31205].includes(value?.twilioError?.code ?? value?.code ?? 0);
+}
+
 export function IncomingCallListener() {
   const { profile } = useAuth();
   const { hasPermission } = usePermissions();
@@ -31,6 +43,9 @@ export function IncomingCallListener() {
   const answeringRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const setupAttemptRef = useRef(0);
+  const deviceRef = useRef<Device | null>(null);
+  const freshTokenRequiredRef = useRef(false);
+  const scopeRef = useRef<string | null>(null);
   const removeCallListenersRef = useRef<(() => void) | null>(null);
 
   const clearTimer = useCallback(() => {
@@ -131,9 +146,11 @@ export function IncomingCallListener() {
     const attempt = ++setupAttemptRef.current;
     let device: Device | null = null;
     const current = () => attempt === setupAttemptRef.current;
+    const scope = `${profile?.company_id ?? ''}:${profile?.id ?? ''}`;
+    if (scopeRef.current !== scope) setPanelOpen(false);
+    scopeRef.current = scope;
     clearIncomingCall();
     setIncomingStatus('ringing');
-    setPanelOpen(false);
     setError(null);
     setDeviceStatus(canReceiveCalls ? 'checking' : 'unavailable');
     async function initialize() {
@@ -155,8 +172,12 @@ export function IncomingCallListener() {
         const registeredDevice = new TwilioDevice(token, {
           codecPreferences: [TwilioCall.Codec.Opus, TwilioCall.Codec.PCMU],
           logLevel: 1, tokenRefreshMs: 30000,
+          enableImprovedSignalingErrorPrecision: true,
+          maxCallSignalingTimeoutMs: 30000,
         });
         device = registeredDevice;
+        deviceRef.current = registeredDevice;
+        freshTokenRequiredRef.current = false;
         registeredDevice.on('incoming', (call) => { if (current()) handleIncoming(call); });
         registeredDevice.on('registered', () => {
           if (current()) { setDeviceStatus('ready'); setError(null); }
@@ -164,7 +185,8 @@ export function IncomingCallListener() {
         registeredDevice.on('unregistered', () => { if (current()) setDeviceStatus('unavailable'); });
         registeredDevice.on('error', (deviceError) => {
           if (!current()) return;
-          setError(deviceError.message || 'Calling is unavailable.');
+          if (needsFreshToken(deviceError)) freshTokenRequiredRef.current = true;
+          setError(callingError(deviceError));
           setDeviceStatus('error');
         });
         registeredDevice.on('tokenWillExpire', async () => {
@@ -174,14 +196,15 @@ export function IncomingCallListener() {
             if (token && current()) registeredDevice.updateToken(token);
           } catch (tokenError) {
             if (!current()) return;
-            setError(tokenError instanceof Error ? tokenError.message : 'Could not refresh calling access.');
+            freshTokenRequiredRef.current = true;
+            setError(callingError(tokenError));
             setDeviceStatus('error');
           }
         });
         await registeredDevice.register();
       } catch (setupError) {
         if (!current()) return;
-        setError(setupError instanceof Error ? setupError.message : 'Calling is unavailable.');
+        setError(callingError(setupError));
         setDeviceStatus('error');
       }
     }
@@ -189,11 +212,29 @@ export function IncomingCallListener() {
     return () => {
       setupAttemptRef.current += 1;
       const call = callRef.current;
+      if (deviceRef.current === device) deviceRef.current = null;
       clearIncomingCall();
       call?.disconnect();
       device?.destroy();
     };
   }, [canReceiveCalls, clearIncomingCall, handleIncoming, profile?.company_id, profile?.id, requestToken, retry]);
+
+  const reconnectCalling = () => {
+    const device = deviceRef.current;
+    if (device && device.state === 'unregistered' && !freshTokenRequiredRef.current) {
+      // Invoke register directly from the click; some browsers require the
+      // registration's audio setup to begin in a user gesture.
+      setError(null);
+      setDeviceStatus('checking');
+      void device.register().catch((registerError) => {
+        if (deviceRef.current !== device) return;
+        setError(callingError(registerError));
+        setDeviceStatus('error');
+      });
+      return;
+    }
+    setRetry((value) => value + 1);
+  };
 
   if (!canReceiveCalls) return null;
 
@@ -256,7 +297,7 @@ export function IncomingCallListener() {
           {incomingStatus === 'ended' && <p className="text-xs text-muted-foreground">Call ended or answered elsewhere.</p>}
           {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
           {(deviceStatus === 'error' || deviceStatus === 'unavailable') &&
-            <Button variant="outline" onClick={() => setRetry((value) => value + 1)}>Reconnect calling</Button>}
+            <Button variant="outline" onClick={reconnectCalling}>Reconnect calling</Button>}
         </div> : <div className="flex flex-col items-center gap-4 py-4">
           {deviceStatus !== 'ready' && <p role="status" className="text-xs text-muted-foreground">{statusLabel}</p>}
           <div className="flex h-14 w-14 items-center justify-center rounded-full bg-emerald-500/10">
