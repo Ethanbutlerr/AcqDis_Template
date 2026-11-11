@@ -625,7 +625,11 @@ Deno.serve(async (req: Request) => {
         body: new URLSearchParams({ AccountSid: accountSid, FriendlyName: "AcqDis browser calling" }),
       });
       if (!keyResponse.ok) {
-        return new Response(JSON.stringify({ error: "Twilio could not create a browser calling key. Check the Account SID and Auth Token in Settings > Integrations." }), {
+        const twilioError = await keyResponse.json().catch(() => ({}));
+        const detail = [keyResponse.status, twilioError.code, String(twilioError.message ?? "").slice(0, 160)]
+          .filter(Boolean).join(" / ");
+        console.error("Twilio browser key creation failed", detail);
+        return new Response(JSON.stringify({ error: `Twilio rejected browser key creation (${detail}). Check the Account SID and Auth Token in Settings > Integrations.` }), {
           status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }

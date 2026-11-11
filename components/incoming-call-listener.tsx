@@ -266,7 +266,9 @@ export function IncomingCallListener() {
         body: { action: 'repair_browser_key', company_id: profile.company_id, user_id: profile.id },
       });
       if (repairError || !data?.success) {
-        setError(data?.error || repairError?.message || 'Unable to repair browser calling.');
+        const response = (repairError as { context?: Response } | null)?.context;
+        const failure = response ? await response.json().catch(() => null) : null;
+        setError(failure?.error || data?.error || repairError?.message || 'Unable to repair browser calling.');
         return;
       }
       setRepairNeeded(false);
